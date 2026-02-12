@@ -126,6 +126,10 @@ class MobileApp {
       });
     });
     
+    // Match scouting sheet
+    $('#closeMatchScoutSheet')?.addEventListener('click', () => this.closeMatchScoutSheet());
+    $('#matchScoutOverlay')?.addEventListener('click', () => this.closeMatchScoutSheet());
+    
     // Team select for data view
     $('#mobileTeamSelect').addEventListener('change', (e) => {
       if (e.target.value) this.loadTeamData(e.target.value);
@@ -193,7 +197,7 @@ class MobileApp {
         ];
       }
       
-      this.populateEventSelect(todayData.events || []);
+      // Events are selected via event picker modal, no need to populate a select
       
       // If no current event but there are events today, pick the first one
       if (!this.currentEvent && todayData.events && todayData.events.length > 0) {
@@ -570,12 +574,11 @@ class MobileApp {
     container.innerHTML = html;
     initIcons();
     
-    // Wire up tap actions on match cards
+    // Wire up tap actions on match cards → open match scouting sheet
     container.querySelectorAll('.m-match-card').forEach(card => {
       card.addEventListener('click', () => {
-        // Find the winning team or first team and show stats
-        const teamNum = parseInt(card.dataset.focusTeam);
-        if (teamNum) this.showTeamStats(teamNum);
+        const matchDesc = card.querySelector('.m-match-label')?.textContent;
+        if (matchDesc) this.openMatchScoutSheet(matchDesc);
       });
     });
   }
@@ -670,6 +673,319 @@ class MobileApp {
         ` : ''}
       </div>
     `;
+  }
+  
+  // ===================== Match Scouting Sheet =====================
+  
+  async openMatchScoutSheet(matchDescription) {
+    const match = this.matches.find(m => (m.description || `Match ${m.matchNumber}`) === matchDescription);
+    if (!match) return;
+    
+    // Update header
+    const titleEl = $('#matchScoutTitle');
+    const subtitleEl = $('#matchScoutSubtitle');
+    if (titleEl) titleEl.textContent = matchDescription;
+    
+    const resultText = match.completed
+      ? (match.red.score > match.blue.score ? 'Red Wins' : match.red.score < match.blue.score ? 'Blue Wins' : 'Tie')
+      : 'Upcoming';
+    if (subtitleEl) subtitleEl.textContent = resultText;
+    
+    // Build alliance summary
+    const myTeam = parseInt(this.teamNumber);
+    const alliancesEl = $('#matchScoutAlliances');
+    if (alliancesEl) {
+      const renderTeams = (teams) => teams.map(t => 
+        `<span class="${t === myTeam ? 'highlight' : ''}">${t}</span>`
+      ).join(' ');
+      
+      alliancesEl.innerHTML = `
+        <div class="match-scout-alliance">
+          <span class="match-scout-alliance-label red">Red</span>
+          <span class="match-scout-alliance-score red">${match.completed ? (match.red.score ?? '—') : '—'}</span>
+          <div class="match-scout-alliance-teams">${renderTeams(match.red.teams)}</div>
+        </div>
+        <span class="match-scout-vs">VS</span>
+        <div class="match-scout-alliance">
+          <span class="match-scout-alliance-label blue">Blue</span>
+          <span class="match-scout-alliance-score blue">${match.completed ? (match.blue.score ?? '—') : '—'}</span>
+          <div class="match-scout-alliance-teams">${renderTeams(match.blue.teams)}</div>
+        </div>
+      `;
+    }
+    
+    // Show sheet immediately with loading state
+    const teamsEl = $('#matchScoutTeams');
+    if (teamsEl) {
+      teamsEl.innerHTML = `
+        <div class="empty-state" style="padding: var(--space-xl);">
+          <div class="mobile-loading-spinner" style="width: 24px; height: 24px; margin: 0 auto var(--space-md);"></div>
+          <div class="empty-state-text">Loading notes...</div>
+        </div>
+      `;
+    }
+    
+    this._showMatchScoutSheet();
+    
+    // Load existing notes for this match
+    let existingNotes = { private_notes: [], public_notes: [] };
+    try {
+      existingNotes = await api.getMatchNotes(this.currentEvent, { match: matchDescription });
+    } catch (e) {
+      console.warn('Could not load match notes:', e);
+    }
+    
+    // Build team note cards
+    const allTeams = [
+      ...match.red.teams.map(t => ({ number: t, alliance: 'red' })),
+      ...match.blue.teams.map(t => ({ number: t, alliance: 'blue' })),
+    ];
+    
+    const teamCards = allTeams.map(team => {
+      const rankData = this.rankings.find(r => r.teamNumber === team.number);
+      const rankStr = rankData ? `#${rankData.rank} · ${rankData.wins}W ${rankData.losses}L` : 'Unranked';
+      const isYourTeam = team.number.toString() === this.teamNumber;
+      
+      const privateNote = (existingNotes.private_notes || []).find(n => parseInt(n.team_number) === team.number) || null;
+      const publicNoteOwn = (existingNotes.public_notes || []).find(
+        n => parseInt(n.team_number) === team.number && n.scouting_team === this.teamNumber
+      ) || null;
+      const otherPublicNotes = (existingNotes.public_notes || []).filter(
+        n => parseInt(n.team_number) === team.number && n.scouting_team !== this.teamNumber
+      );
+      
+      return `
+        <div class="ms-team-card">
+          <div class="ms-team-card-header ${team.alliance}">
+            <div class="ms-team-card-name">
+              Team ${team.number}
+              ${isYourTeam ? '<span class="ms-team-you-badge">YOU</span>' : ''}
+            </div>
+            <span class="ms-team-card-rank">${rankStr}</span>
+          </div>
+          <div class="ms-team-card-body">
+            <div class="ms-note-area">
+              <div class="ms-note-label">Public Notes</div>
+              <textarea class="ms-note-input" 
+                data-match="${matchDescription}" 
+                data-team="${team.number}" 
+                data-private="0"
+                placeholder="Notes visible to your team..."
+                rows="2">${publicNoteOwn?.notes || ''}</textarea>
+            </div>
+            <div class="ms-note-area">
+              <div class="ms-note-label">Private Notes</div>
+              <textarea class="ms-note-input" 
+                data-match="${matchDescription}" 
+                data-team="${team.number}" 
+                data-private="1"
+                placeholder="Only visible to you..."
+                rows="2">${privateNote?.notes || ''}</textarea>
+            </div>
+            ${otherPublicNotes.length > 0 ? `
+              <div class="ms-other-notes">
+                <div class="ms-other-notes-title">Notes from other scouts</div>
+                ${otherPublicNotes.map(n => `
+                  <div style="margin-top: 4px;"><strong>Team ${n.scouting_team}:</strong> ${n.notes}</div>
+                `).join('')}
+              </div>
+            ` : ''}
+          </div>
+          <div class="ms-save-row">
+            <button class="ms-save-btn" onclick="mobileApp.saveMatchTeamNotes('${matchDescription}', '${team.number}', this)">Save</button>
+          </div>
+        </div>
+      `;
+    }).join('');
+    
+    if (teamsEl) teamsEl.innerHTML = teamCards;
+  }
+  
+  async saveMatchTeamNotes(matchDescription, teamNumber, btnEl) {
+    const publicTextarea = document.querySelector(`.ms-note-input[data-match="${matchDescription}"][data-team="${teamNumber}"][data-private="0"]`);
+    const privateTextarea = document.querySelector(`.ms-note-input[data-match="${matchDescription}"][data-team="${teamNumber}"][data-private="1"]`);
+    
+    try {
+      const promises = [];
+      
+      if (publicTextarea && publicTextarea.value.trim()) {
+        promises.push(api.saveMatchNote(this.currentEvent, matchDescription, teamNumber, publicTextarea.value, false));
+      }
+      if (privateTextarea && privateTextarea.value.trim()) {
+        promises.push(api.saveMatchNote(this.currentEvent, matchDescription, teamNumber, privateTextarea.value, true));
+      }
+      
+      if (promises.length === 0) {
+        toast.info('Enter some notes first');
+        return;
+      }
+      
+      await Promise.all(promises);
+      
+      // Visual feedback
+      if (btnEl) {
+        btnEl.textContent = 'Saved ✓';
+        btnEl.classList.add('saved');
+        setTimeout(() => {
+          btnEl.textContent = 'Save';
+          btnEl.classList.remove('saved');
+        }, 2000);
+      }
+      
+      toast.success(`Notes saved for Team ${teamNumber}`);
+    } catch (e) {
+      console.error('Failed to save match notes:', e);
+      toast.error('Failed to save notes');
+    }
+  }
+  
+  _showMatchScoutSheet() {
+    $('#matchScoutSheet')?.classList.add('open');
+    $('#matchScoutOverlay')?.classList.add('active');
+    document.body.style.overflow = 'hidden';
+    initIcons();
+  }
+  
+  closeMatchScoutSheet() {
+    $('#matchScoutSheet')?.classList.remove('open');
+    $('#matchScoutOverlay')?.classList.remove('active');
+    document.body.style.overflow = '';
+  }
+  
+  // ===================== Match Notes in Team Data View =====================
+  
+  async loadTeamMatchNotes(team, container) {
+    const teamNum = parseInt(team);
+    
+    // Find all matches this team played in
+    const teamMatches = this.matches.filter(m => 
+      m.red.teams.includes(teamNum) || m.blue.teams.includes(teamNum)
+    ).sort((a, b) => {
+      const aNum = parseInt((a.description || '').match(/\d+/)?.[0] || a.matchNumber || 0);
+      const bNum = parseInt((b.description || '').match(/\d+/)?.[0] || b.matchNumber || 0);
+      return bNum - aNum;
+    });
+    
+    if (teamMatches.length === 0) return;
+    
+    // Load notes for this team
+    let allNotes = [];
+    try {
+      const matchNotesData = await api.getMatchNotes(this.currentEvent, { team: team.toString() });
+      allNotes = [
+        ...(matchNotesData.private_notes || []).map(n => ({ ...n, isPrivate: true, isYours: true })),
+        ...(matchNotesData.public_notes || []).map(n => ({ ...n, isPrivate: false, isYours: n.scouting_team === this.teamNumber })),
+      ];
+    } catch (e) {
+      console.warn('Could not load match notes:', e);
+    }
+    
+    // Group notes by match
+    const notesByMatch = {};
+    allNotes.forEach(note => {
+      if (!notesByMatch[note.match_number]) notesByMatch[note.match_number] = [];
+      notesByMatch[note.match_number].push(note);
+    });
+    
+    const totalNotes = allNotes.length;
+    
+    // Build the match notes section
+    const matchItems = teamMatches.map(match => {
+      const desc = match.description || `Match ${match.matchNumber}`;
+      const isRed = match.red.teams.includes(teamNum);
+      const hasScore = match.red.score != null && match.blue.score != null;
+      const won = hasScore && ((isRed && match.red.score > match.blue.score) || (!isRed && match.blue.score > match.red.score));
+      const lost = hasScore && !won && match.red.score !== match.blue.score;
+      const notes = notesByMatch[desc] || [];
+      const noteCount = notes.length;
+      
+      let resultBadge = '';
+      let resultClass = '';
+      if (hasScore) {
+        if (won) { resultBadge = 'W'; resultClass = 'win'; }
+        else if (lost) { resultBadge = 'L'; resultClass = 'loss'; }
+        else { resultBadge = 'T'; resultClass = 'tie'; }
+      }
+      
+      const yourPrivate = notes.filter(n => n.isPrivate && n.isYours);
+      const yourPublic = notes.filter(n => !n.isPrivate && n.isYours);
+      const othersPublic = notes.filter(n => !n.isPrivate && !n.isYours);
+      
+      const renderNotes = (notesList, label, cssClass) => {
+        if (notesList.length === 0) return '';
+        return `
+          <div class="mn-note-group">
+            <div class="mn-note-group-label ${cssClass}">${label}</div>
+            ${notesList.map(n => `
+              <div class="mn-note-entry">
+                ${n.scouting_team && !n.isYours ? `<span class="mn-note-source">Team ${n.scouting_team}</span>` : ''}
+                ${n.notes}
+              </div>
+            `).join('')}
+          </div>
+        `;
+      };
+      
+      const allianceColor = isRed ? 'red' : 'blue';
+      
+      return `
+        <div class="mn-item" onclick="this.classList.toggle('expanded')">
+          <div class="mn-header">
+            <span class="mn-alliance-bar ${allianceColor}"></span>
+            <div class="mn-header-left">
+              <span class="mn-match-name">${desc}</span>
+              ${hasScore ? `
+                <span class="mn-score">
+                  <span class="mn-score-red">${match.red.score}</span>
+                  <span class="mn-score-sep">-</span>
+                  <span class="mn-score-blue">${match.blue.score}</span>
+                </span>
+              ` : '<span class="mn-upcoming">Upcoming</span>'}
+            </div>
+            <div class="mn-header-right">
+              ${noteCount > 0 ? `<span class="mn-note-badge">${noteCount}</span>` : ''}
+              ${resultBadge ? `<span class="mn-result ${resultClass}">${resultBadge}</span>` : ''}
+              <span class="mn-chevron">›</span>
+            </div>
+          </div>
+          <div class="mn-expand">
+            <div class="mn-alliances">
+              <div class="mn-alliance red">
+                ${match.red.teams.map(t => `<span class="${t === teamNum ? 'mn-team-highlight' : ''}">${t}</span>`).join(' ')}
+              </div>
+              <span class="mn-alliance-vs">vs</span>
+              <div class="mn-alliance blue">
+                ${match.blue.teams.map(t => `<span class="${t === teamNum ? 'mn-team-highlight' : ''}">${t}</span>`).join(' ')}
+              </div>
+            </div>
+            ${noteCount > 0 ? `
+              <div class="mn-notes-body">
+                ${renderNotes(yourPrivate, 'Your Private', 'private')}
+                ${renderNotes(yourPublic, 'Your Public', 'public')}
+                ${renderNotes(othersPublic, 'Other Teams', 'others')}
+              </div>
+            ` : `
+              <div class="mn-no-notes">No notes for this match</div>
+            `}
+            <button class="mn-add-note-btn" onclick="event.stopPropagation(); mobileApp.openMatchScoutSheet('${desc}')">
+              + Add Notes
+            </button>
+          </div>
+        </div>
+      `;
+    }).join('');
+    
+    container.insertAdjacentHTML('beforeend', `
+      <div class="match-notes-section">
+        <div class="match-notes-header">
+          <div class="match-notes-title">Match Notes</div>
+          ${totalNotes > 0 ? `<span class="match-notes-count">${totalNotes}</span>` : ''}
+        </div>
+        <div class="match-notes-list">
+          ${matchItems}
+        </div>
+      </div>
+    `);
   }
   
   showTeamStats(teamNumber) {
@@ -883,6 +1199,9 @@ class MobileApp {
       }
       
       container.innerHTML = html;
+      
+      // Also load match notes for this team
+      this.loadTeamMatchNotes(team, container);
       
     } catch (error) {
       toast.error('Failed to load team data');
