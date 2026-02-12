@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#0a0a0f">
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
+  <title>WikiScout</title>
+  <link rel="stylesheet" href="css/variables.css">
+  <link rel="stylesheet" href="css/base.css">
+  <link rel="stylesheet" href="css/components.css">
+  <link rel="stylesheet" href="css/mobile.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' fill='%2300d26a'/><text x='50' y='70' font-size='60' text-anchor='middle' fill='white' font-weight='bold'>W</text></svg>">
+  <link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' fill='%2300d26a'/><text x='50' y='70' font-size='60' text-anchor='middle' fill='white' font-weight='bold'>W</text></svg>">
+</head>
+<body>
+  <div class="mobile-layout">
+    <!-- Loading Screen -->
+    <div class="mobile-loading" id="loadingScreen">
+      <div class="mobile-loading-spinner"></div>
+      <div class="mobile-loading-text">Loading WikiScout...</div>
+    </div>
+    
+    <!-- Header -->
+    <header class="mobile-header">
+      <div>
+        <div class="mobile-header-title" id="mobileTitle">WikiScout</div>
+        <div class="mobile-header-subtitle" id="mobileSubtitle">Team #---</div>
+      </div>
+      <div style="display: flex; gap: var(--space-sm);">
+        <button class="btn btn-icon btn-ghost" id="mobileOtpBtn">
+          <span data-icon="key" data-icon-size="20"></span>
+        </button>
+        <button class="btn btn-icon btn-ghost" id="mobileLogoutBtn">
+          <span data-icon="logout" data-icon-size="20"></span>
+      </button>
+      </div>
+    </header>
+    
+    <!-- Main Content Container -->
+    <div class="mobile-content-container">
+      <main class="mobile-content">
+      
+      <!-- Rankings Screen -->
+      <div class="screen active" id="screen-rankings">
+        <!-- Event Banner -->
+        <div class="event-banner" id="rankingsEventBanner">
+          <div class="event-banner-icon">
+            <span data-icon="mapPin"></span>
+          </div>
+          <div class="event-banner-info">
+            <div class="event-banner-name" id="rankingsEventName">No Event Selected</div>
+            <div class="event-banner-code" id="rankingsEventCode">---</div>
+          </div>
+          <span class="event-banner-chevron" data-icon="chevronDown" data-icon-size="16"></span>
+        </div>
+        
+        <div class="rankings-list" id="mobileRankingsList">
+          <div class="empty-state">
+            <div class="empty-state-icon" data-icon="rankings" data-icon-size="48"></div>
+            <div class="empty-state-title">No Rankings</div>
+            <div class="empty-state-text">Rankings will appear when data is available</div>
+          </div>
+        </div>
+      </div>
+      
+      <!-- Data View Screen -->
+      <div class="screen" id="screen-data">
+        <div class="team-selector">
+          <label class="team-selector-label">Select Team</label>
+          <select class="form-input form-select" id="mobileTeamSelect">
+            <option value="">Choose team...</option>
+          </select>
+        </div>
+        
+        <div id="mobileTeamData">
+          <div class="empty-state">
+            <div class="empty-state-icon" data-icon="data" data-icon-size="48"></div>
+            <div class="empty-state-title">Select a Team</div>
+            <div class="empty-state-text">Choose a team to view scouting data</div>
+          </div>
+        </div>
+      </div>
+      
+      <!-- Scout Screen -->
+      <div class="screen" id="screen-scout">
+        <!-- Event Banner -->
+        <div class="event-banner" id="scoutEventBanner">
+          <div class="event-banner-icon">
+            <span data-icon="mapPin"></span>
+          </div>
+          <div class="event-banner-info">
+            <div class="event-banner-name" id="scoutEventName">No Event Selected</div>
+            <div class="event-banner-code" id="scoutEventCode">---</div>
+          </div>
+          <span class="event-banner-chevron" data-icon="chevronDown" data-icon-size="16"></span>
+        </div>
+        
+        <form id="mobileScoutForm" class="scout-form">
+          <div class="scout-form-section">
+            <div class="scout-form-header">Team Selection</div>
+            <div class="scout-form-fields">
+              <div class="scout-field">
+                <label class="scout-field-label">Team Number</label>
+                <select class="form-input form-select" id="mobileScoutTeam" required>
+                  <option value="">Select Team</option>
+                </select>
+              </div>
+            </div>
+          </div>
+          
+          <!-- Dynamic form sections will be inserted here -->
+          <div id="mobileFormFields"></div>
+          
+          <button type="submit" class="btn btn-primary btn-lg scout-submit-float">Submit</button>
+        </form>
+      </div>
+      </main>
+    </div>
+    
+    <!-- Bottom Navigation Container -->
+    <div class="mobile-nav-container">
+      <nav class="mobile-nav">
+      <a href="#" class="mobile-nav-item active" data-screen="rankings">
+        <span class="mobile-nav-icon" data-icon="rankings"></span>
+        <span class="mobile-nav-label">Rankings</span>
+      </a>
+      <a href="#" class="mobile-nav-item" data-screen="data">
+        <span class="mobile-nav-icon" data-icon="data"></span>
+        <span class="mobile-nav-label">Data</span>
+      </a>
+      <a href="#" class="mobile-nav-item" data-screen="scout">
+        <span class="mobile-nav-icon" data-icon="plus"></span>
+        <span class="mobile-nav-label">Scout</span>
+      </a>
+      </nav>
+    </div>
+    
+    <!-- FAB for quick scout -->
+    <button class="fab" id="fabScout" style="display: none;">
+      <span data-icon="plus" data-icon-size="24"></span>
+    </button>
+  </div>
+  
+  <!-- Team Stats Popup (Match History) -->
+  <div class="stats-popup" id="statsPopup">
+    <div class="stats-popup-content">
+      <div class="stats-popup-header">
+        <div class="stats-popup-title" id="statsTeamTitle">Team 0000</div>
+        <div class="stats-popup-subtitle" id="statsTeamName">Team Name</div>
+      </div>
+      
+      <div class="stats-wlt">
+        <div class="stats-wlt-box wins" id="statsWins">0</div>
+        <div class="stats-wlt-box ties" id="statsTies">0</div>
+        <div class="stats-wlt-box losses" id="statsLosses">0</div>
+      </div>
+      
+      <div class="stats-played" id="statsPlayed">Matches Played: 0</div>
+      
+      <div class="stats-match-list" id="statsMatchList">
+        <!-- Match results will be inserted here -->
+      </div>
+      
+      <div class="stats-actions">
+        <button class="btn btn-primary" id="statsViewData">View Scouting Data</button>
+        <button class="btn btn-ghost" id="statsClose">Close</button>
+      </div>
+    </div>
+  </div>
+  
+  <!-- Mobile Event Picker Modal -->
+  <div class="mobile-ep-overlay" id="mobileEventPickerModal" style="display: none;">
+    <div class="mobile-ep-dialog">
+      <div class="mobile-ep-header">
+        <h3>Select Event</h3>
+        <div style="display: flex; align-items: center; gap: 12px;">
+          <select class="form-input form-select" id="mobileEpSeasonSelect" style="display: none; width: 100px; padding: 4px 8px; font-size: 12px;">
+            <!-- Seasons populated by JS -->
+          </select>
+          <button class="btn btn-ghost btn-icon btn-sm" id="mobileEpClose">
+            <span data-icon="x" data-icon-size="18"></span>
+          </button>
+        </div>
+      </div>
+      <div class="mobile-ep-search">
+        <div class="search-input">
+          <span class="search-input-icon" data-icon="search" data-icon-size="16"></span>
+          <input type="text" placeholder="Search events..." id="mobileEpSearchInput" autocomplete="off">
+        </div>
+      </div>
+      <div class="mobile-ep-tabs">
+        <button class="mobile-ep-tab active" data-ep-filter="today">Today</button>
+        <button class="mobile-ep-tab" data-ep-filter="my-team">My Team</button>
+        <button class="mobile-ep-tab" data-ep-filter="all">All</button>
+      </div>
+      <div class="mobile-ep-list" id="mobileEpEventList">
+        <div class="mobile-ep-loading">Loading events...</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- OTP Bottom Sheet -->
+  <div class="bottom-sheet" id="otpSheet">
+    <div class="bottom-sheet-header">
+      <h3 class="bottom-sheet-title">Desktop Login</h3>
+      <button class="btn btn-icon btn-ghost btn-sm" id="closeOtpSheet">
+        <span data-icon="x" data-icon-size="20"></span>
+      </button>
+    </div>
+    <div class="bottom-sheet-body">
+      <p style="color: var(--text-secondary); margin-bottom: var(--space-xl); text-align: center;">
+        Use this code to log in to the desktop version of WikiScout
+      </p>
+      
+      <div class="otp-label" style="text-align: center; margin-bottom: var(--space-md); font-weight: 600;">Your OTP Code</div>
+      <div class="otp-digits" id="mobileOtpDigits" style="margin-bottom: var(--space-xl);">
+        <div class="otp-digit">-</div>
+        <div class="otp-digit">-</div>
+        <div class="otp-digit">-</div>
+        <div class="otp-dash">-</div>
+        <div class="otp-digit">-</div>
+        <div class="otp-digit">-</div>
+        <div class="otp-digit">-</div>
+      </div>
+      
+      <div style="display: flex; gap: var(--space-md);">
+        <button class="btn btn-danger" id="mobileDeleteOtp" style="flex: 1;">Delete</button>
+        <button class="btn btn-primary" id="mobileRegenOtp" style="flex: 1;">Regenerate</button>
+      </div>
+    </div>
+  </div>
+  
+  <!-- Modal Overlay for OTP Sheet -->
+  <div class="modal-overlay" id="otpSheetOverlay"></div>
+  
+  <!-- Scripts -->
+  <script src="js/view-detector.js"></script>
+  <script src="js/icons.js"></script>
+  <script src="js/utils.js"></script>
+  <script src="js/api.js"></script>
+  <script src="js/mobile-app.js"></script>
+</body>
+</html>
