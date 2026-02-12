@@ -55,7 +55,7 @@ class MobileApp {
     window.addEventListener('auth:unauthorized', (e) => {
       // Check if this is not a demo mode scenario
       if (!e.detail?.allowDemo) {
-      window.location.href = 'index.html';
+        window.location.href = 'index.html';
       }
     });
   }
@@ -84,6 +84,7 @@ class MobileApp {
     // Update title
     const titles = {
       rankings: 'Rankings',
+      matches: 'Matches',
       data: 'Team Data',
       scout: 'Scout'
     };
@@ -113,6 +114,17 @@ class MobileApp {
     // OTP buttons in sheet
     $('#mobileDeleteOtp')?.addEventListener('click', () => this.deleteOtp());
     $('#mobileRegenOtp')?.addEventListener('click', () => this.regenerateOtp());
+    
+    // Match filter pills
+    this.matchFilter = 'my-team';
+    document.querySelectorAll('.match-filter-pill').forEach(pill => {
+      pill.addEventListener('click', () => {
+        this.matchFilter = pill.dataset.matchFilter;
+        document.querySelectorAll('.match-filter-pill').forEach(p => p.classList.remove('active'));
+        pill.classList.add('active');
+        this.renderMatches();
+      });
+    });
     
     // Team select for data view
     $('#mobileTeamSelect').addEventListener('change', (e) => {
@@ -210,12 +222,12 @@ class MobileApp {
     const name = this.eventName || this.currentEvent || 'No Event Selected';
     const code = this.currentEvent || '---';
     
-    ['#rankingsEventName', '#scoutEventName'].forEach(sel => {
+    ['#rankingsEventName', '#matchesEventName', '#scoutEventName'].forEach(sel => {
       const el = $(sel);
       if (el) el.textContent = name;
     });
     
-    ['#rankingsEventCode', '#scoutEventCode'].forEach(sel => {
+    ['#rankingsEventCode', '#matchesEventCode', '#scoutEventCode'].forEach(sel => {
       const el = $(sel);
       if (el) el.textContent = code;
     });
@@ -279,6 +291,7 @@ class MobileApp {
       this.updateEventBanners();
       this.populateTeamSelects();
       this.renderRankings();
+      this.renderMatches();
       this.renderScoutForm();
       
     } catch (error) {
@@ -392,7 +405,7 @@ class MobileApp {
 
     console.log('Demo data generated:', this.teams.length, 'teams,', this.rankings.length, 'rankings,', this.matches.length, 'matches');
   }
-  
+
   populateTeamSelects() {
     ['#mobileTeamSelect', '#mobileScoutTeam'].forEach(selector => {
       const select = $(selector);
@@ -414,6 +427,9 @@ class MobileApp {
         break;
       case 'rankings':
         this.renderRankings();
+        break;
+      case 'matches':
+        this.renderMatches();
         break;
     }
   }
@@ -449,6 +465,211 @@ class MobileApp {
         </div>
       </div>
     `).join('');
+  }
+  
+  renderMatches() {
+    const container = $('#mobileMatchList');
+    if (!container) return;
+    
+    if (this.matches.length === 0) {
+      container.innerHTML = `
+        <div class="empty-state">
+          <div class="empty-state-icon" data-icon="matches" data-icon-size="48"></div>
+          <div class="empty-state-title">No Matches</div>
+          <div class="empty-state-text">Match schedule will appear when data is available</div>
+        </div>
+      `;
+      initIcons();
+      return;
+    }
+    
+    const myTeam = parseInt(this.teamNumber);
+    let matches = [...this.matches];
+    
+    // Apply filter
+    if (this.matchFilter === 'my-team') {
+      matches = matches.filter(m =>
+        m.red.teams.includes(myTeam) || m.blue.teams.includes(myTeam)
+      );
+    } else if (this.matchFilter === 'upcoming') {
+      matches = matches.filter(m => !m.completed);
+    }
+    
+    // Sort: upcoming first (by match number asc), then completed (by match number desc)
+    matches.sort((a, b) => {
+      if (a.completed !== b.completed) return a.completed ? 1 : -1;
+      return a.matchNumber - b.matchNumber;
+    });
+    
+    if (matches.length === 0) {
+      const msg = this.matchFilter === 'my-team'
+        ? `No matches found for Team ${this.teamNumber}`
+        : 'No matches match the current filter';
+      container.innerHTML = `
+        <div class="empty-state">
+          <div class="empty-state-icon" data-icon="matches" data-icon-size="48"></div>
+          <div class="empty-state-title">No Matches</div>
+          <div class="empty-state-text">${msg}</div>
+        </div>
+      `;
+      initIcons();
+      return;
+    }
+    
+    // Compute WLT summary for my team
+    const myMatches = this.matches.filter(m =>
+      m.completed && (m.red.teams.includes(myTeam) || m.blue.teams.includes(myTeam))
+    );
+    let wins = 0, losses = 0, ties = 0;
+    myMatches.forEach(m => {
+      const isRed = m.red.teams.includes(myTeam);
+      const myScore = isRed ? m.red.score : m.blue.score;
+      const oppScore = isRed ? m.blue.score : m.red.score;
+      if (myScore > oppScore) wins++;
+      else if (myScore < oppScore) losses++;
+      else ties++;
+    });
+    
+    let html = '';
+    
+    // Summary chips
+    if (this.matchFilter === 'my-team' && myMatches.length > 0) {
+      html += `
+        <div class="match-summary-bar">
+          <div class="match-summary-chip wins">
+            <span class="chip-count">${wins}</span> W
+          </div>
+          <div class="match-summary-chip losses">
+            <span class="chip-count">${losses}</span> L
+          </div>
+          <div class="match-summary-chip">
+            <span class="chip-count">${ties}</span> T
+          </div>
+          <div class="match-summary-chip">
+            <span class="chip-count">${myMatches.length}</span> Played
+          </div>
+        </div>
+      `;
+    }
+    
+    // Group matches
+    const upcoming = matches.filter(m => !m.completed);
+    const completed = matches.filter(m => m.completed);
+    
+    if (upcoming.length > 0) {
+      html += `<div class="match-list-section-label">Upcoming (${upcoming.length})</div>`;
+      html += upcoming.map(m => this._renderMatchCard(m, myTeam)).join('');
+    }
+    
+    if (completed.length > 0) {
+      html += `<div class="match-list-section-label">Completed (${completed.length})</div>`;
+      // Show most recent completed first
+      html += completed.reverse().map(m => this._renderMatchCard(m, myTeam)).join('');
+    }
+    
+    container.innerHTML = html;
+    initIcons();
+    
+    // Wire up tap actions on match cards
+    container.querySelectorAll('.m-match-card').forEach(card => {
+      card.addEventListener('click', () => {
+        // Find the winning team or first team and show stats
+        const teamNum = parseInt(card.dataset.focusTeam);
+        if (teamNum) this.showTeamStats(teamNum);
+      });
+    });
+  }
+  
+  _renderMatchCard(match, myTeam) {
+    const isMyMatch = match.red.teams.includes(myTeam) || match.blue.teams.includes(myTeam);
+    const isCompleted = match.completed;
+    
+    // Determine winner
+    let redWin = false, blueWin = false;
+    if (isCompleted && match.red.score !== null && match.blue.score !== null) {
+      redWin = match.red.score > match.blue.score;
+      blueWin = match.blue.score > match.red.score;
+    }
+    
+    // For my-team filter, figure out result
+    let resultClass = '';
+    if (isMyMatch && isCompleted) {
+      const isRed = match.red.teams.includes(myTeam);
+      const myScore = isRed ? match.red.score : match.blue.score;
+      const oppScore = isRed ? match.blue.score : match.red.score;
+      if (myScore > oppScore) resultClass = 'my-win';
+      else if (myScore < oppScore) resultClass = 'my-loss';
+      else resultClass = 'my-tie';
+    }
+    
+    // Focus team for click (prefer my team, otherwise red team 1)
+    const focusTeam = isMyMatch ? myTeam : (match.red.teams[0] || match.blue.teams[0] || 0);
+    
+    const status = isCompleted ? 'completed' : 'upcoming';
+    
+    const renderTeamTags = (teams, alliance) => {
+      return teams.map(t => {
+        let cls = 'm-match-team-tag';
+        if (t === myTeam) cls += ' highlight';
+        return `<span class="${cls}">${t}</span>`;
+      }).join('');
+    };
+    
+    return `
+      <div class="m-match-card ${isMyMatch ? 'my-match' : ''} ${!isCompleted ? 'upcoming' : ''} ${resultClass}" data-focus-team="${focusTeam}">
+        <div class="m-match-top">
+          <span class="m-match-label">${match.description || `Match ${match.matchNumber}`}</span>
+          <span class="m-match-status ${status}">${isCompleted ? 'Final' : 'Upcoming'}</span>
+        </div>
+        <div class="m-match-body">
+          <div class="m-match-alliance red">
+            <div class="m-match-score ${redWin ? 'winner' : ''} ${!isCompleted ? 'pending' : ''}">
+              ${isCompleted ? (match.red.score ?? '—') : '—'}
+            </div>
+            <div class="m-match-teams">
+              ${renderTeamTags(match.red.teams, 'red')}
+            </div>
+          </div>
+          <div class="m-match-vs">VS</div>
+          <div class="m-match-alliance blue">
+            <div class="m-match-score ${blueWin ? 'winner' : ''} ${!isCompleted ? 'pending' : ''}">
+              ${isCompleted ? (match.blue.score ?? '—') : '—'}
+            </div>
+            <div class="m-match-teams">
+              ${renderTeamTags(match.blue.teams, 'blue')}
+            </div>
+          </div>
+        </div>
+        ${isCompleted && match.red.auto !== null ? `
+          <div class="m-match-breakdown">
+            <div class="m-match-stat">
+              <div class="m-match-stat-values">
+                <span class="red-val">${match.red.auto ?? '—'}</span>
+                <span>·</span>
+                <span class="blue-val">${match.blue.auto ?? '—'}</span>
+              </div>
+              <div class="m-match-stat-label">Auto</div>
+            </div>
+            <div class="m-match-stat">
+              <div class="m-match-stat-values">
+                <span class="red-val">${match.red.score !== null ? (match.red.score - (match.red.auto || 0) - (match.red.foul || 0)) : '—'}</span>
+                <span>·</span>
+                <span class="blue-val">${match.blue.score !== null ? (match.blue.score - (match.blue.auto || 0) - (match.blue.foul || 0)) : '—'}</span>
+              </div>
+              <div class="m-match-stat-label">Teleop</div>
+            </div>
+            <div class="m-match-stat">
+              <div class="m-match-stat-values">
+                <span class="red-val">${match.red.foul ?? '—'}</span>
+                <span>·</span>
+                <span class="blue-val">${match.blue.foul ?? '—'}</span>
+              </div>
+              <div class="m-match-stat-label">Foul</div>
+            </div>
+          </div>
+        ` : ''}
+      </div>
+    `;
   }
   
   showTeamStats(teamNumber) {
@@ -515,12 +736,12 @@ class MobileApp {
             <div class="match-result-value ${teamAlliance}-alliance">${match[teamAlliance].teams.join(' ')}</div>
             <div class="match-result-vs">VS</div>
             <div class="match-result-value ${oppAlliance}-alliance">${match[oppAlliance].teams.join(' ')}</div>
-                </div>
+          </div>
           <div class="match-result-details">
             <div class="match-result-value">${match[teamAlliance].auto ?? '-'}</div>
             <div class="match-result-label-sm">Auto</div>
             <div class="match-result-value">${match[oppAlliance].auto ?? '-'}</div>
-              </div>
+          </div>
           <div class="match-result-details">
             <div class="match-result-value">${match[teamAlliance].foul ?? '-'}</div>
             <div class="match-result-label-sm">Foul</div>

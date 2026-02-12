@@ -2800,8 +2800,8 @@
 @media (max-width: 1024px) {
   .team-members-layout {
     grid-template-columns: 1fr;
-}
-
+  }
+  
   .member-detail-layout {
     grid-template-columns: 1fr;
   }
@@ -3542,8 +3542,8 @@
   .stats-grid {
     grid-template-columns: repeat(2, 1fr);
   }
-  }
-  
+}
+
 @media (max-width: 900px) {
   .overview-three-col {
     grid-template-columns: 1fr;

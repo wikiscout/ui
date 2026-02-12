@@ -1,6 +1,6 @@
 // WikiScout API Client
 
-const API_BASE = 'https://mihr.wikiscout.org'; // Production API
+const API_BASE = 'https://api.wikiscout.org'; // Production API - update with your API URL
 
 class WikiScoutAPI {
   constructor(baseUrl = API_BASE) {

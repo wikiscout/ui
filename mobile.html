@@ -37,7 +37,7 @@
         </button>
         <button class="btn btn-icon btn-ghost" id="mobileLogoutBtn">
           <span data-icon="logout" data-icon-size="20"></span>
-      </button>
+        </button>
       </div>
     </header>
     
@@ -64,6 +64,36 @@
             <div class="empty-state-icon" data-icon="rankings" data-icon-size="48"></div>
             <div class="empty-state-title">No Rankings</div>
             <div class="empty-state-text">Rankings will appear when data is available</div>
+          </div>
+        </div>
+      </div>
+      
+      <!-- Matches Screen -->
+      <div class="screen" id="screen-matches">
+        <!-- Event Banner -->
+        <div class="event-banner" id="matchesEventBanner">
+          <div class="event-banner-icon">
+            <span data-icon="mapPin"></span>
+          </div>
+          <div class="event-banner-info">
+            <div class="event-banner-name" id="matchesEventName">No Event Selected</div>
+            <div class="event-banner-code" id="matchesEventCode">---</div>
+          </div>
+          <span class="event-banner-chevron" data-icon="chevronDown" data-icon-size="16"></span>
+        </div>
+        
+        <!-- Match Filter Pills -->
+        <div class="match-filter-bar">
+          <button class="match-filter-pill active" data-match-filter="my-team">My Team</button>
+          <button class="match-filter-pill" data-match-filter="all">All</button>
+          <button class="match-filter-pill" data-match-filter="upcoming">Upcoming</button>
+        </div>
+        
+        <div class="match-list-container" id="mobileMatchList">
+          <div class="empty-state">
+            <div class="empty-state-icon" data-icon="matches" data-icon-size="48"></div>
+            <div class="empty-state-title">No Matches</div>
+            <div class="empty-state-text">Match schedule will appear when data is available</div>
           </div>
         </div>
       </div>
@@ -129,20 +159,24 @@
         <span class="mobile-nav-icon" data-icon="rankings"></span>
         <span class="mobile-nav-label">Rankings</span>
       </a>
+      <a href="#" class="mobile-nav-item" data-screen="matches">
+        <span class="mobile-nav-icon" data-icon="matches"></span>
+        <span class="mobile-nav-label">Matches</span>
+      </a>
       <a href="#" class="mobile-nav-item" data-screen="data">
         <span class="mobile-nav-icon" data-icon="data"></span>
         <span class="mobile-nav-label">Data</span>
       </a>
       <a href="#" class="mobile-nav-item" data-screen="scout">
-        <span class="mobile-nav-icon" data-icon="plus"></span>
+        <span class="mobile-nav-icon" data-icon="scout"></span>
         <span class="mobile-nav-label">Scout</span>
       </a>
       </nav>
     </div>
     
     <!-- FAB for quick scout -->
-    <button class="fab" id="fabScout" style="display: none;">
-      <span data-icon="plus" data-icon-size="24"></span>
+    <button class="fab" id="fabScout">
+      <span data-icon="scout" data-icon-size="24"></span>
     </button>
   </div>
   
@@ -237,7 +271,7 @@
   
   <!-- Modal Overlay for OTP Sheet -->
   <div class="modal-overlay" id="otpSheetOverlay"></div>
-  
+
   <!-- Scripts -->
   <script src="js/view-detector.js"></script>
   <script src="js/icons.js"></script>
