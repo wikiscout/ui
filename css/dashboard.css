@@ -1,5 +1,35 @@
 /* Dashboard Layout - SellAux Style */
 
+/* ===== Desktop Update Toast ===== */
+.update-toast {
+  position: fixed;
+  top: var(--space-lg);
+  right: var(--space-lg);
+  z-index: 99999;
+  background: var(--bg-card);
+  border: 1px solid var(--warning, #f59e0b);
+  border-radius: var(--radius-lg);
+  padding: var(--space-md) var(--space-lg);
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+  animation: slideInRight 0.3s ease;
+}
+.update-toast-text {
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.update-toast-btn {
+  flex-shrink: 0;
+  cursor: pointer;
+}
+@keyframes slideInRight {
+  from { transform: translateX(100%); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+
 /* ===== Main Layout ===== */
 .app-layout {
   display: flex;
@@ -331,12 +361,86 @@
   opacity: 1;
 }
 
+/* === Queuing Soon Banner === */
+.queuing-soon-banner {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  padding: var(--space-md) var(--space-lg);
+  background: linear-gradient(135deg, rgba(255, 171, 0, 0.15), rgba(255, 171, 0, 0.08));
+  border: 1px solid rgba(255, 171, 0, 0.4);
+  border-radius: var(--radius-lg);
+  margin-bottom: var(--space-lg);
+  animation: queuing-pulse 2s ease-in-out infinite;
+}
+
+@keyframes queuing-pulse {
+  0%, 100% { border-color: rgba(255, 171, 0, 0.4); }
+  50% { border-color: rgba(255, 171, 0, 0.8); }
+}
+
+.queuing-soon-icon {
+  color: var(--warning, #ffab00);
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+}
+
+.queuing-soon-content {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  flex-wrap: wrap;
+}
+
+.queuing-soon-label {
+  font-weight: 700;
+  font-size: var(--text-sm);
+  color: var(--warning, #ffab00);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.queuing-soon-detail {
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+/* === Event Ended (Read-Only) Banner === */
+.event-ended-banner {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  padding: var(--space-sm) var(--space-lg);
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-lg);
+  margin-bottom: var(--space-lg);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+.event-ended-banner .event-ended-icon {
+  display: flex;
+  align-items: center;
+  opacity: 0.5;
+}
+
+.event-ended-banner .event-ended-label {
+  font-weight: 600;
+}
+
 /* === Upcoming Matches Single Row === */
 .upcoming-matches-row {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
   gap: 10px;
   overflow: hidden;
+}
+
+.upcoming-matches-row > .empty-state {
+  grid-column: 1 / -1;
+  justify-self: center;
 }
 
 /* === Upcoming Compact Card === */
@@ -870,9 +974,19 @@
   font-weight: 600;
   color: var(--primary);
   white-space: nowrap;
+  font-size: var(--text-xs);
+  display: inline-block;
+  min-width: 44px;
+  font-variant-numeric: tabular-nums;
+}
+
+.ranking-team-name {
+  color: var(--text-muted);
+  font-weight: 400;
+  font-size: 0.85em;
+  white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  font-size: var(--text-xs);
 }
 
 .ranking-stat {
@@ -883,6 +997,33 @@
 
 .ranking-stat.wins { color: var(--success); }
 .ranking-stat.losses { color: var(--danger); }
+
+/* Shared alignment for team number + name in all leaderboards */
+.rank-team,
+.overview-rank-team {
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs);
+  min-width: 0;
+}
+
+.rank-team-number {
+  font-weight: 600;
+  color: var(--primary);
+  white-space: nowrap;
+  display: inline-block;
+  min-width: 44px;
+  font-variant-numeric: tabular-nums;
+}
+
+.rank-team-name {
+  color: var(--text-muted);
+  font-weight: 400;
+  font-size: 0.85em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 
 .card-subtitle {
   font-size: 10px;
@@ -1887,6 +2028,24 @@
 .data-browser-team {
   font-weight: 600;
   color: var(--text-primary);
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+}
+
+.data-browser-team-num {
+  display: inline-block;
+  min-width: 44px;
+  font-variant-numeric: tabular-nums;
+}
+
+.data-browser-team-name {
+  color: var(--text-muted);
+  font-weight: 400;
+  font-size: 0.85em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .data-browser-rank {

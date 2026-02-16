@@ -6,14 +6,26 @@ class DashboardApp {
     this.teamNumber = null;
     this.userName = null;
     this.teams = [];
+    this.teamNameMap = {};     // { teamNumber: nameShort } lookup
     this.rankings = [];
     this.matches = [];
+    this.schedule = [];       // schedule with startTime for each match
     this.oprData = [];
     this.sosData = [];
     this.selectedDataTeam = null;
     this.subAccounts = [];
     this.selectedMemberId = null;
     this.loading = false;
+    this.currentPage = 'overview';
+    
+    // Event metadata
+    this.eventDateEnd = null;   // ISO string of event end date
+    this.eventStatus = null;    // 'live' | 'past' | 'upcoming'
+    this.eventEnded = false;    // derived: is event in the past?
+    
+    // Auto-refresh config
+    this.autoRefreshInterval = 5000;  // milliseconds (overridden by server config)
+    this._refreshTimer = null;
     
     this.init();
   }
@@ -40,6 +52,9 @@ class DashboardApp {
     this.navigateTo('overview');
     
     this.showLoading(false);
+    
+    // Start auto-refresh
+    this._startAutoRefresh();
   }
   
   showLoading(show) {
@@ -164,6 +179,8 @@ class DashboardApp {
   }
   
   navigateTo(page) {
+    this.currentPage = page;
+    
     // Update nav
     $$('.nav-item').forEach(item => {
       item.classList.toggle('active', item.dataset.page === page);
@@ -229,9 +246,10 @@ class DashboardApp {
       this.updateScoutPreview();
       const submitTeam = $('#scoutSubmitTeam');
       if (submitTeam) {
-        submitTeam.textContent = e.target.value ? `Team ${e.target.value}` : 'No team selected';
+        submitTeam.textContent = e.target.value ? `Team ${e.target.value}${this.getTeamName(e.target.value) ? ' · ' + this.getTeamName(e.target.value) : ''}` : 'No team selected';
       }
       this.loadScoutTeamMatchNotes(e.target.value);
+      this.autofillScoutForm(e.target.value);
     });
     
     // Data browser search
@@ -293,6 +311,9 @@ class DashboardApp {
     $('#profileUploadBtn')?.addEventListener('click', () => this.startPhotoUpload());
     $('#profileCancelQr')?.addEventListener('click', () => this.cancelPhotoUpload());
     $('#profileCopyUrl')?.addEventListener('click', () => this.copyProfileUrl());
+    
+    // Custom Questions
+    this.setupCustomQuestionsListeners();
   }
   
   async loadInitialData() {
@@ -303,9 +324,28 @@ class DashboardApp {
         return { found: false };
       });
       
+      // Apply server-side config (auto-refresh interval, etc.)
+      if (meData.config) {
+        const interval = meData.config.desktop_refresh_interval;
+        this.autoRefreshInterval = (typeof interval === 'number' && interval >= 0) ? interval : 5000;
+      }
+
       if (meData.found && meData.event) {
-        this.currentEvent = meData.event.code;
-        this.eventName = meData.event.name || this.currentEvent;
+        // Store all events for division grouping
+        this._allTeamEvents = meData.allEvents || [];
+
+        // Auto-select division event: if the team has multiple active events
+        // where one code is a prefix of another, prefer the longer (division) code
+        const activeEvents = (meData.allEvents || []).filter(e => e.status === 'live');
+        let pickedEvent = meData.event;
+        if (activeEvents.length > 1) {
+          pickedEvent = this._pickDivisionEvent(activeEvents);
+        }
+
+        this.currentEvent = pickedEvent.code;
+        this.eventName = pickedEvent.name || this.currentEvent;
+        this.eventDateEnd = pickedEvent.endDate || null;
+        this.eventStatus = pickedEvent.status || 'live';
         storage.set('currentEvent', this.currentEvent);
         
         // Update event display
@@ -318,6 +358,7 @@ class DashboardApp {
         await this.loadEventData();
       } else {
         // No event found - check for stored event or show event picker
+        this._allTeamEvents = meData.allEvents || [];
         this.currentEvent = storage.get('currentEvent');
         if (this.currentEvent) {
           await this.loadEventData();
@@ -331,6 +372,30 @@ class DashboardApp {
       // Still show the UI, just without event data
       this.showNoEventState();
     }
+  }
+
+  /**
+   * Given multiple active events, pick the best one (prefer division event).
+   * If a team is in USMNCMP and USMNCMPGLXY, pick USMNCMPGLXY (the division).
+   */
+  _pickDivisionEvent(activeEvents) {
+    if (activeEvents.length === 0) return activeEvents[0];
+    if (activeEvents.length === 1) return activeEvents[0];
+
+    // Sort by code length descending — longer code = more specific (division)
+    const sorted = [...activeEvents].sort((a, b) => b.code.length - a.code.length);
+
+    // Check if the longest code starts with any shorter code (indicates division)
+    for (const longer of sorted) {
+      for (const shorter of sorted) {
+        if (longer.code !== shorter.code && longer.code.startsWith(shorter.code)) {
+          return longer;
+        }
+      }
+    }
+
+    // No prefix relationship found — just pick the first active event
+    return sorted[0];
   }
   
   async loadTodayEvents() {
@@ -378,17 +443,35 @@ class DashboardApp {
   async loadEventData() {
     if (!this.currentEvent) return;
     
+    // Reset all data before loading new event
+    this.teams = [];
+    this.teamNameMap = {};
+    this.rankings = [];
+    this.matches = [];
+    this.schedule = [];
+    this.oprData = [];
+    this.sosData = [];
+    this.demoMatchNotes = null;
+    this.matchScoutNotesCache = {};
+    
     try {
-      // Load teams, rankings, and matches in parallel
-      const [teamsData, rankingsData, matchesData] = await Promise.all([
+      // Load teams, rankings, matches, and schedule in parallel
+      const [teamsData, rankingsData, matchesData, scheduleData] = await Promise.all([
         api.getTeams(this.currentEvent).catch(() => null),
         api.getRankings(this.currentEvent).catch(() => null),
-        api.getMatches(this.currentEvent).catch(() => null)
+        api.getMatches(this.currentEvent).catch(() => null),
+        api.getEventSchedule(this.currentEvent).catch(() => null)
       ]);
       
       // Process teams
       if (teamsData && teamsData.teams) {
         this.teams = teamsData.teams.map(t => t.teamNumber || t);
+        // Build team name lookup from API data
+        teamsData.teams.forEach(t => {
+          if (t.nameShort || t.nameFull) {
+            this.teamNameMap[t.teamNumber || t] = t.nameShort || t.nameFull || '';
+          }
+        });
       }
       
       // Process rankings (worker returns lowercase 'rankings')
@@ -404,6 +487,12 @@ class DashboardApp {
           sortOrder1: r.sortOrder1 || 0,
           sortOrder2: r.sortOrder2 || 0
         }));
+        // Supplement name map from rankings (rankings have teamName)
+        rankings.forEach(r => {
+          if (r.teamName && !this.teamNameMap[r.teamNumber]) {
+            this.teamNameMap[r.teamNumber] = r.teamName;
+          }
+        });
       }
       
       // Process matches (worker returns lowercase 'matches')
@@ -427,25 +516,62 @@ class DashboardApp {
         }));
       }
       
+      // Process schedule (has startTime for each match)
+      if (scheduleData && scheduleData.schedule) {
+        this.schedule = scheduleData.schedule.map(s => ({
+          description: s.description,
+          matchNumber: s.matchNumber,
+          startTime: s.startTime,
+          teams: s.teams || []
+        }));
+      }
+      
       // Calculate advanced stats
       this.calculateOPR();
       this.calculateSoS();
       
-      // Generate demo match notes for testing
-      this.generateDemoMatchNotes();
+      // Determine if event has ended
+      this._updateEventEndedStatus();
       
-      // Update UI
+      // Only generate demo notes for DEVDATA events
+      if (this._isDevDataEvent()) {
+      this.generateDemoMatchNotes();
+      }
+      
+      // Update dashboard overview UI
       this.updateStats();
       this.populateTeamSelects();
       this.renderUpcomingMatches();
       this.renderRecentResults();
       this.renderTopRankings();
       this.renderScoreAnalysis();
+      this._updateQueuingBanner();
+      this._updateEventEndedUI();
+      
+      // Re-render the currently active page so it reflects the new event data
+      if (this.currentPage && this.currentPage !== 'overview') {
+        this.loadPageData(this.currentPage);
+      }
       
     } catch (error) {
       console.error('Failed to load event data:', error);
       toast.error('Failed to load event data');
     }
+  }
+  
+  _isDevDataEvent() {
+    return this.currentEvent && ['DEVDATA0', 'DEVDATA1'].includes(this.currentEvent.toUpperCase());
+  }
+
+  /** Get the short team name (or empty string) for a team number */
+  getTeamName(num) {
+    return this.teamNameMap[num] || this.teamNameMap[parseInt(num)] || '';
+  }
+
+  /** Return "TEAM_NUM · Name" if name exists, otherwise just "TEAM_NUM" */
+  teamLabel(num) {
+    const name = this.getTeamName(num);
+    return name ? `${num} · ${name}` : `${num}`;
   }
   
   async refreshData() {
@@ -466,6 +592,130 @@ class DashboardApp {
         btn.innerHTML = '<span data-icon="refresh" data-icon-size="16"></span> Refresh';
         initIcons();
       }
+    }
+  }
+  
+  // ---- Auto-Refresh ----
+  
+  _startAutoRefresh() {
+    this._stopAutoRefresh();
+    if (this.autoRefreshInterval > 0) {
+      this._refreshTimer = setInterval(() => this._silentRefresh(), this.autoRefreshInterval);
+    }
+  }
+  
+  _stopAutoRefresh() {
+    if (this._refreshTimer) {
+      clearInterval(this._refreshTimer);
+      this._refreshTimer = null;
+    }
+  }
+  
+  async _silentRefresh() {
+    if (!this.currentEvent) return;
+    if (this._silentRefreshing) return; // prevent overlap
+    
+    // Only auto-refresh on data-display pages, NOT on forms or settings
+    const refreshPages = ['overview', 'rankings', 'matches'];
+    if (!refreshPages.includes(this.currentPage)) return;
+    
+    this._silentRefreshing = true;
+    
+    const btn = $('#refreshBtn');
+    if (btn) {
+      btn.innerHTML = '<span data-icon="refresh" data-icon-size="16" class="spin"></span> Refreshing...';
+      initIcons();
+    }
+    
+    try {
+      await this.loadEventData();
+    } catch (e) {
+      // Silent fail — don't toast
+      console.warn('Silent refresh failed:', e);
+    } finally {
+      this._silentRefreshing = false;
+      if (btn) {
+        btn.innerHTML = '<span data-icon="refresh" data-icon-size="16"></span> Refresh';
+        initIcons();
+      }
+    }
+  }
+  
+  // ---- Event Status Helpers ----
+  
+  _isEventEnded() {
+    return this.eventEnded === true;
+  }
+  
+  _updateEventEndedStatus() {
+    if (this.eventDateEnd) {
+      // Event has ended if end date + 1 day buffer is in the past
+      const endTime = new Date(this.eventDateEnd).getTime() + 24 * 60 * 60 * 1000;
+      this.eventEnded = Date.now() > endTime;
+    } else if (this.eventStatus === 'past') {
+      this.eventEnded = true;
+    } else {
+      // Fallback: if all matches are completed and there's at least some data
+      this.eventEnded = this.matches.length > 0 && this.matches.every(m => m.completed);
+    }
+  }
+  
+  // ---- Queuing Soon Banner ----
+  
+  _updateQueuingBanner() {
+    const banner = $('#queuingSoonBanner');
+    const detail = $('#queuingSoonDetail');
+    if (!banner) return;
+    
+    // Don't show for ended events
+    if (this._isEventEnded()) {
+      banner.style.display = 'none';
+      return;
+    }
+    
+    const teamNum = parseInt(this.teamNumber);
+    if (!teamNum || this.schedule.length === 0) {
+      banner.style.display = 'none';
+      return;
+    }
+    
+    const now = Date.now();
+    const tenMinutes = 10 * 60 * 1000;
+    
+    // Find upcoming scheduled matches for this team within the next 10 minutes
+    const queuingMatch = this.schedule.find(s => {
+      if (!s.startTime) return false;
+      const matchTime = new Date(s.startTime).getTime();
+      const diff = matchTime - now;
+      // Match is in the future and within 10 minutes
+      if (diff < 0 || diff > tenMinutes) return false;
+      // Check if our team is in this match
+      const teamNums = (s.teams || []).map(t => t.teamNumber);
+      return teamNums.includes(teamNum);
+    });
+    
+    if (queuingMatch) {
+      const matchTime = new Date(queuingMatch.startTime);
+      const minsLeft = Math.max(1, Math.ceil((matchTime.getTime() - now) / 60000));
+      const matchDesc = queuingMatch.description || `Match ${queuingMatch.matchNumber}`;
+      if (detail) detail.textContent = `${matchDesc} starts in ~${minsLeft} min`;
+      banner.style.display = 'flex';
+      initIcons();
+    } else {
+      banner.style.display = 'none';
+    }
+  }
+  
+  // ---- Event Ended UI ----
+  
+  _updateEventEndedUI() {
+    const upcomingCard = $('#upcomingMatchesCard');
+    
+    if (this._isEventEnded()) {
+      // Hide upcoming matches card for ended events
+      if (upcomingCard) upcomingCard.style.display = 'none';
+    } else {
+      if (upcomingCard) upcomingCard.style.display = '';
     }
   }
   
@@ -495,7 +745,7 @@ class DashboardApp {
       if (select) {
         const currentValue = select.value;
         select.innerHTML = '<option value="">Select a team...</option>' +
-          this.teams.map(t => `<option value="${t}">${t}</option>`).join('');
+          this.teams.map(t => `<option value="${t}">${this.teamLabel(t)}</option>`).join('');
         if (currentValue && this.teams.includes(parseInt(currentValue))) {
           select.value = currentValue;
         }
@@ -536,7 +786,7 @@ class DashboardApp {
         return `
           <div class="ranking-row ${isHighlight ? 'highlight' : ''}" onclick="app.viewTeamData(${team.teamNumber})">
             <div class="rank-position ${team.rank === 1 ? 'gold' : team.rank === 2 ? 'silver' : team.rank === 3 ? 'bronze' : ''}">${team.rank}</div>
-            <div class="rank-team">${team.teamNumber}</div>
+            <div class="rank-team"><span class="rank-team-number">${team.teamNumber}</span>${this.getTeamName(team.teamNumber) ? `<span class="rank-team-name">· ${this.getTeamName(team.teamNumber)}</span>` : ''}</div>
             <div class="rank-stat" style="color: var(--success);">${team.wins}</div>
             <div class="rank-stat" style="color: var(--danger);">${team.losses}</div>
             <div class="rank-stat" style="color: var(--text-muted);">${team.ties}</div>
@@ -587,11 +837,11 @@ class DashboardApp {
         </div>
         <div class="upcoming-card-teams">
           <div class="upcoming-alliance red">
-            ${match.red.teams.map(t => `<span class="upcoming-team ${t.toString() === this.teamNumber ? 'highlight' : ''}">${t}</span>`).join('')}
+            ${match.red.teams.map(t => `<span class="upcoming-team ${t.toString() === this.teamNumber ? 'highlight' : ''}" title="${this.getTeamName(t)}">${t}</span>`).join('')}
             </div>
           <span class="upcoming-vs">vs</span>
           <div class="upcoming-alliance blue">
-            ${match.blue.teams.map(t => `<span class="upcoming-team ${t.toString() === this.teamNumber ? 'highlight' : ''}">${t}</span>`).join('')}
+            ${match.blue.teams.map(t => `<span class="upcoming-team ${t.toString() === this.teamNumber ? 'highlight' : ''}" title="${this.getTeamName(t)}">${t}</span>`).join('')}
           </div>
             </div>
           </div>
@@ -653,14 +903,14 @@ class DashboardApp {
           <div class="mini-alliance red">
             <div class="mini-alliance-score red">${match.red.total ?? '-'}</div>
             <div class="mini-alliance-teams">
-              ${match.red.teams.map(t => `<span class="mini-alliance-team ${t.toString() === this.teamNumber ? 'highlight' : ''}">${t}</span>`).join('')}
+              ${match.red.teams.map(t => `<span class="mini-alliance-team ${t.toString() === this.teamNumber ? 'highlight' : ''}" title="${this.getTeamName(t)}">${t}</span>`).join('')}
             </div>
           </div>
           <div class="mini-match-vs">VS</div>
           <div class="mini-alliance blue">
             <div class="mini-alliance-score blue">${match.blue.total ?? '-'}</div>
             <div class="mini-alliance-teams">
-              ${match.blue.teams.map(t => `<span class="mini-alliance-team ${t.toString() === this.teamNumber ? 'highlight' : ''}">${t}</span>`).join('')}
+              ${match.blue.teams.map(t => `<span class="mini-alliance-team ${t.toString() === this.teamNumber ? 'highlight' : ''}" title="${this.getTeamName(t)}">${t}</span>`).join('')}
             </div>
           </div>
         </div>
@@ -695,7 +945,7 @@ class DashboardApp {
       return `
         <div class="overview-opr-row ${isHighlight ? 'highlight' : ''}" onclick="app.viewTeamData(${team.teamNumber})">
           <div class="overview-rank-pos ${team.rank === 1 ? 'gold' : team.rank === 2 ? 'silver' : team.rank === 3 ? 'bronze' : ''}">#${team.rank}</div>
-          <div class="overview-rank-team">${team.teamNumber}</div>
+          <div class="overview-rank-team"><span class="rank-team-number">${team.teamNumber}</span>${this.getTeamName(team.teamNumber) ? `<span class="rank-team-name">· ${this.getTeamName(team.teamNumber)}</span>` : ''}</div>
           <div class="overview-opr-value">${team.opr.toFixed(1)}</div>
         </div>
       `;
@@ -911,6 +1161,7 @@ class DashboardApp {
         break;
       case 'scout':
         this.renderScoutForm();
+        this.renderScoutCustomFields();
         break;
       case 'match-scout':
         this.renderMatchScoutPage();
@@ -920,6 +1171,9 @@ class DashboardApp {
         break;
       case 'otp':
         this.loadSubAccounts();
+        break;
+      case 'settings':
+        this.renderCustomQuestionsManager();
         break;
       case 'profile':
         this.initCardPreviewListeners();
@@ -974,6 +1228,7 @@ class DashboardApp {
           <div class="ranking-position ${team.rank === 1 ? 'gold' : team.rank === 2 ? 'silver' : team.rank === 3 ? 'bronze' : ''}">#${team.rank}</div>
           <div class="ranking-team">
             <span class="ranking-team-number">${team.teamNumber}</span>
+            ${this.getTeamName(team.teamNumber) ? `<span class="ranking-team-name">${this.getTeamName(team.teamNumber)}</span>` : ''}
           </div>
           <div class="ranking-stat wins">${team.wins}</div>
           <div class="ranking-stat losses">${team.losses}</div>
@@ -1125,6 +1380,7 @@ class DashboardApp {
           <div class="ranking-position ${team.rank === 1 ? 'gold' : team.rank === 2 ? 'silver' : team.rank === 3 ? 'bronze' : ''}">#${team.rank}</div>
           <div class="ranking-team">
             <span class="ranking-team-number">${team.teamNumber}</span>
+            ${this.getTeamName(team.teamNumber) ? `<span class="ranking-team-name">${this.getTeamName(team.teamNumber)}</span>` : ''}
             <div class="opr-bar" style="flex:1; margin-left: var(--space-sm);">
               <div class="opr-bar-fill" style="width: ${barWidth}%"></div>
             </div>
@@ -1257,6 +1513,7 @@ class DashboardApp {
           <div class="ranking-position ${team.rank === 1 ? 'gold' : team.rank === 2 ? 'silver' : team.rank === 3 ? 'bronze' : ''}">#${team.rank}</div>
           <div class="ranking-team">
             <span class="ranking-team-number">${team.teamNumber}</span>
+            ${this.getTeamName(team.teamNumber) ? `<span class="ranking-team-name">${this.getTeamName(team.teamNumber)}</span>` : ''}
           </div>
           <div class="sos-value ${sosClass}">${team.sos > 0 ? '+' : ''}${team.sos.toFixed(1)}</div>
           ${sosLabel ? `<span class="sos-indicator ${sosClass}">${sosLabel}</span>` : '<span style="width:40px"></span>'}
@@ -1355,7 +1612,7 @@ class DashboardApp {
           <span data-icon="trophy" data-icon-size="12"></span>
         </div>
         <div class="top-performer-info">
-          <div class="top-performer-team">Team ${mostWins.teamNumber}</div>
+          <div class="top-performer-team">${this.teamLabel(mostWins.teamNumber)}</div>
           <div class="top-performer-stat">Most Wins (${mostWins.wins})</div>
         </div>
       </div>
@@ -1368,7 +1625,7 @@ class DashboardApp {
             <span data-icon="zap" data-icon-size="12"></span>
           </div>
         <div class="top-performer-info">
-            <div class="top-performer-team">Team ${topOPR.teamNumber}</div>
+            <div class="top-performer-team">${this.teamLabel(topOPR.teamNumber)}</div>
             <div class="top-performer-stat">Highest OPR (${topOPR.opr.toFixed(1)})</div>
         </div>
       </div>
@@ -1382,7 +1639,7 @@ class DashboardApp {
             <span data-icon="arrowUp" data-icon-size="12"></span>
           </div>
         <div class="top-performer-info">
-            <div class="top-performer-team">Team ${luckiest.teamNumber}</div>
+            <div class="top-performer-team">${this.teamLabel(luckiest.teamNumber)}</div>
             <div class="top-performer-stat">Luckiest Schedule (+${luckiest.sos.toFixed(1)})</div>
         </div>
       </div>
@@ -1396,7 +1653,7 @@ class DashboardApp {
             <span data-icon="arrowDown" data-icon-size="12"></span>
           </div>
           <div class="top-performer-info">
-            <div class="top-performer-team">Team ${unluckiest.teamNumber}</div>
+            <div class="top-performer-team">${this.teamLabel(unluckiest.teamNumber)}</div>
             <div class="top-performer-stat">Toughest Schedule (${unluckiest.sos.toFixed(1)})</div>
           </div>
         </div>
@@ -1508,7 +1765,7 @@ class DashboardApp {
             <div class="alliance-label red">Red</div>
             <div class="alliance-score red">${match.red.total ?? '-'}</div>
             <div class="alliance-teams">
-              ${match.red.teams.map(t => `<span class="alliance-team ${t.toString() === this.teamNumber ? 'highlight' : ''}">${t}</span>`).join('')}
+              ${match.red.teams.map(t => `<span class="alliance-team ${t.toString() === this.teamNumber ? 'highlight' : ''}" title="${this.getTeamName(t)}">${t}</span>`).join('')}
             </div>
           </div>
           <div class="match-vs">VS</div>
@@ -1516,7 +1773,7 @@ class DashboardApp {
             <div class="alliance-label blue">Blue</div>
             <div class="alliance-score blue">${match.blue.total ?? '-'}</div>
             <div class="alliance-teams">
-              ${match.blue.teams.map(t => `<span class="alliance-team ${t.toString() === this.teamNumber ? 'highlight' : ''}">${t}</span>`).join('')}
+              ${match.blue.teams.map(t => `<span class="alliance-team ${t.toString() === this.teamNumber ? 'highlight' : ''}" title="${this.getTeamName(t)}">${t}</span>`).join('')}
             </div>
           </div>
         </div>
@@ -1613,6 +1870,7 @@ class DashboardApp {
                 </td>
                 <td class="teams-td-team">
                   <span class="teams-team-number">${team.number}</span>
+                  ${this.getTeamName(team.number) ? `<span class="teams-team-name" style="color:var(--text-muted);font-size:0.85em;margin-left:var(--space-xs);">${this.getTeamName(team.number)}</span>` : ''}
                 </td>
                 <td class="teams-td-stat" style="color: var(--success);">${team.wins}</td>
                 <td class="teams-td-stat" style="color: var(--danger);">${team.losses}</td>
@@ -1637,6 +1895,36 @@ class DashboardApp {
   renderScoutForm() {
     const container = $('#scoutFormSections');
     if (!container) return;
+    
+    // Show read-only banner for ended events
+    const scoutForm = $('#scoutForm');
+    if (this._isEventEnded()) {
+      const existingBanner = container.parentElement?.querySelector('.event-ended-banner');
+      if (!existingBanner) {
+        const banner = document.createElement('div');
+        banner.className = 'event-ended-banner';
+        banner.innerHTML = `
+          <span class="event-ended-icon" data-icon="lock" data-icon-size="16"></span>
+          <span class="event-ended-label">This event has ended — scouting form is read-only</span>
+        `;
+        container.parentElement?.insertBefore(banner, container);
+        initIcons();
+      }
+      // Disable submit button
+      const submitBtn = scoutForm?.querySelector('button[type="submit"]');
+      if (submitBtn) {
+        submitBtn.disabled = true;
+        submitBtn.textContent = 'Event Ended — Read Only';
+      }
+    } else {
+      // Remove any stale ended banner
+      container.parentElement?.querySelector('.event-ended-banner')?.remove();
+      const submitBtn = scoutForm?.querySelector('button[type="submit"]');
+      if (submitBtn) {
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Submit Scouting Data';
+      }
+    }
     
     const sections = [
       {
@@ -1676,6 +1964,80 @@ class DashboardApp {
     `).join('');
     
     initIcons();
+  }
+  
+  async autofillScoutForm(teamNumber) {
+    if (!teamNumber || !this.currentEvent) {
+      // Reset the form if no team selected
+      const form = $('#scoutForm');
+      if (form) form.reset();
+      this.renderScoutCustomFields();
+      return;
+    }
+    
+    try {
+      const data = await api.getScoutingData(teamNumber, this.currentEvent);
+      
+      // Use our team's private data (has unredacted values) for autofill
+      const values = data?.private_data?.data;
+      if (!values || !Array.isArray(values) || values.length === 0) {
+        // No existing data — clear the form
+        const form = $('#scoutForm');
+        if (form) form.reset();
+        this.renderScoutCustomFields();
+        return;
+      }
+      
+      // Map field IDs to data array indexes (same order as handleScoutSubmit)
+      const fieldIds = ['mecanum', 'driverPractice', 'teleOpBalls', 'shootingDist',
+                        'autoBalls', 'autoShooting', 'autoPoints', 'autoLeave',
+                        'autoDetails', 'privateNotes'];
+      
+      fieldIds.forEach((id, idx) => {
+        const el = $(`#${id}`);
+        if (!el || idx >= values.length) return;
+        
+        const val = values[idx];
+        
+        if (el.type === 'checkbox') {
+          el.checked = val === true || val === 'true' || val === '1';
+        } else if (el.type === 'range') {
+          el.value = val;
+          // Update the slider display label
+          const label = $(`#${id}Value`);
+          if (label) label.textContent = val;
+        } else {
+          el.value = val || '';
+        }
+      });
+      
+      // Also load custom question responses
+      try {
+        const cqData = await api.getCustomResponses(teamNumber, this.currentEvent);
+        if (cqData?.questions) {
+          cqData.questions.forEach(q => {
+            if (q.value === null || q.value === undefined) return;
+            const el = $(`#cq_${q.id}`);
+            if (!el) return;
+            if (el.type === 'checkbox') {
+              el.checked = q.value === 'true' || q.value === '1';
+            } else if (el.type === 'range') {
+              el.value = q.value;
+              const label = $(`#cq_${q.id}Value`);
+              if (label) label.textContent = q.value;
+            } else {
+              el.value = q.value;
+            }
+          });
+        }
+      } catch (e) {
+        // Custom questions autofill is best-effort
+      }
+      
+      this.updateScoutPreview();
+    } catch (e) {
+      console.warn('Could not autofill scout form:', e);
+    }
   }
   
   renderFormField(field) {
@@ -1773,6 +2135,11 @@ class DashboardApp {
   async handleScoutSubmit(e) {
     e.preventDefault();
     
+    if (this._isEventEnded()) {
+      toast.error('This event has ended — scouting data is read-only');
+      return;
+    }
+    
     const team = $('#scoutTeamSelect').value;
     if (!team) {
       toast.error('Please select a team');
@@ -1808,9 +2175,20 @@ class DashboardApp {
     
     try {
       await api.addScoutingData(team, this.currentEvent, formData);
+      
+      // Also save custom field responses
+      const customResponses = this.getCustomFieldValues();
+      if (customResponses.length > 0) {
+        await api.saveCustomResponses(team, this.currentEvent, customResponses).catch(err => {
+          console.error('Failed to save custom responses:', err);
+        });
+      }
+      
       toast.success('Scouting data saved!');
       e.target.reset();
       this.updateScoutPreview();
+      // Re-render custom fields to reset slider values
+      this.renderScoutCustomFields();
     } catch (error) {
       console.error('Failed to save scouting data:', error);
       toast.error('Failed to save data: ' + (error.message || 'Unknown error'));
@@ -1854,7 +2232,7 @@ class DashboardApp {
         <div class="data-browser-item ${this.selectedDataTeam === team ? 'active' : ''}" 
              data-team="${team}" 
              onclick="app.viewTeamData(${team})">
-          <span class="data-browser-team">${team}</span>
+           <span class="data-browser-team"><span class="data-browser-team-num">${team}</span>${this.getTeamName(team) ? `<span class="data-browser-team-name">· ${this.getTeamName(team)}</span>` : ''}</span>
           ${rank ? `<span class="data-browser-rank">#${rank.rank}</span>` : ''}
         </div>
       `;
@@ -1867,7 +2245,8 @@ class DashboardApp {
     
     items.forEach(item => {
       const teamNumber = item.dataset.team;
-      item.style.display = teamNumber.includes(lowerQuery) ? 'flex' : 'none';
+      const teamName = (this.getTeamName(teamNumber) || '').toLowerCase();
+      item.style.display = (teamNumber.includes(lowerQuery) || teamName.includes(lowerQuery)) ? 'flex' : 'none';
     });
   }
   
@@ -1892,7 +2271,7 @@ class DashboardApp {
     const dataTeamRecord = $('#dataTeamRecord');
     
     if (dataTeamAvatar) dataTeamAvatar.textContent = team.toString().charAt(0);
-    if (dataTeamNumber) dataTeamNumber.textContent = `Team ${team}`;
+    if (dataTeamNumber) dataTeamNumber.textContent = `Team ${team}${this.getTeamName(team) ? ' · ' + this.getTeamName(team) : ''}`;
     
     if (teamRank) {
       if (dataTeamRank) dataTeamRank.textContent = `#${teamRank.rank}`;
@@ -1934,14 +2313,58 @@ class DashboardApp {
       let hasPrivateData = data.private_data && data.private_data.data && data.private_data.data.length > 0;
       let hasPublicData = data.public_data && data.public_data.length > 0;
       
-      // Generate demo scouting data if none exists
-      if (!hasPrivateData && !hasPublicData) {
+      // Only generate demo scouting data for DEVDATA events
+      if (!hasPrivateData && !hasPublicData && this._isDevDataEvent()) {
         data = this.generateDemoScoutingData(team);
         hasPrivateData = data.private_data && data.private_data.data && data.private_data.data.length > 0;
         hasPublicData = data.public_data && data.public_data.length > 0;
       }
       
       if (!hasPrivateData && !hasPublicData) {
+        // Still try to load custom field responses even if no standard scouting data
+        let customOnlyRows = '';
+        try {
+          const cqData = await api.getCustomResponses(team, this.currentEvent);
+          if (cqData?.questions && cqData.questions.length > 0) {
+            customOnlyRows = cqData.questions.map(q => {
+              let displayValue = q.value ?? '-';
+              let valueClass = '';
+              if (q.field_type === 'boolean') {
+                if (q.value === 'true') { displayValue = 'Yes'; valueClass = 'val-yes'; }
+                else if (q.value === 'false') { displayValue = 'No'; valueClass = 'val-no'; }
+                else { displayValue = '-'; }
+              } else if ((q.field_type === 'number' || q.field_type === 'slider') && (q.value === null || q.value === '')) {
+                displayValue = '-';
+              } else if (!q.value) { displayValue = '-'; }
+              return `<div class="data-row"><span class="data-row-label">${this._escapeHtml(q.label)}</span><span class="data-row-value ${valueClass}">${this._escapeHtml(String(displayValue))}</span></div>`;
+            }).join('');
+          }
+        } catch (e) { /* ignore */ }
+        
+        if (customOnlyRows) {
+          container.innerHTML = `
+            <div class="data-entry data-entry-yours">
+              <div class="data-entry-header">
+                <div class="data-entry-title">
+                  <span data-icon="star" data-icon-size="16" style="color: var(--success);"></span>
+                  Your Scouting Data
+                </div>
+                <span class="badge" style="background: var(--success-alpha-10); color: var(--success);">Your Team</span>
+              </div>
+              <div class="data-entry-body">
+                <div class="data-rows">
+                  <div class="empty-state-text" style="padding: var(--space-sm) 0; color: var(--text-muted);">No standard fields submitted</div>
+                </div>
+                <div style="border-top: 1px solid var(--border-secondary); margin-top: var(--space-sm); padding-top: var(--space-sm);">
+                  <div style="font-size: var(--text-xs); color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: var(--space-xs); display: flex; align-items: center; gap: var(--space-xs);">
+                    Custom Fields <span class="badge" style="background: var(--primary-alpha-10); color: var(--primary); font-size: 9px; padding: 1px 6px;">Private</span>
+                  </div>
+                  ${customOnlyRows}
+                </div>
+              </div>
+            </div>
+          `;
+        } else {
         container.innerHTML = `
           <div class="empty-state">
             <div class="empty-state-icon" data-icon="clipboard" data-icon-size="48"></div>
@@ -1949,6 +2372,7 @@ class DashboardApp {
             <div class="empty-state-text">Be the first to scout this team!</div>
           </div>
         `;
+        }
         initIcons();
         return;
       }
@@ -1971,6 +2395,51 @@ class DashboardApp {
           });
         });
       }
+      
+      // Pre-fetch custom field responses (private to this team)
+      let customFieldRows = '';
+      try {
+        const cqData = await api.getCustomResponses(team, this.currentEvent);
+        if (cqData?.questions && cqData.questions.length > 0) {
+          customFieldRows = cqData.questions.map(q => {
+            let displayValue = q.value ?? '-';
+            let valueClass = '';
+            
+            if (q.field_type === 'boolean') {
+              if (q.value === 'true') { displayValue = 'Yes'; valueClass = 'val-yes'; }
+              else if (q.value === 'false') { displayValue = 'No'; valueClass = 'val-no'; }
+              else { displayValue = '-'; }
+            } else if (q.field_type === 'number' || q.field_type === 'slider') {
+              if (q.value !== null && q.value !== '') {
+                valueClass = 'val-number';
+              } else {
+                displayValue = '-';
+              }
+            } else if (!q.value) {
+              displayValue = '-';
+            }
+            
+            return `
+              <div class="data-row">
+                <span class="data-row-label">${this._escapeHtml(q.label)}</span>
+                <span class="data-row-value ${valueClass}">${this._escapeHtml(String(displayValue))}</span>
+              </div>
+            `;
+          }).join('');
+        }
+      } catch (e) {
+        console.warn('Failed to load custom responses:', e);
+      }
+      
+      // Build custom fields section with divider (only for "Your Data" card)
+      const customFieldsSection = customFieldRows ? `
+        <div style="border-top: 1px solid var(--border-secondary); margin-top: var(--space-sm); padding-top: var(--space-sm);">
+          <div style="font-size: var(--text-xs); color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: var(--space-xs); display: flex; align-items: center; gap: var(--space-xs);">
+            Custom Fields <span class="badge" style="background: var(--primary-alpha-10); color: var(--primary); font-size: 9px; padding: 1px 6px;">Private</span>
+          </div>
+          ${customFieldRows}
+        </div>
+      ` : '';
       
       // Render scouting data entries
       const fieldLabels = data.fields || ['Mecanum Drive', 'Driver Practice', 'Tele-OP Balls', 'Shooting Dist', 
@@ -2046,6 +2515,7 @@ class DashboardApp {
               <div class="data-entry-body">
                 <div class="data-rows">${shortFieldsHTML}</div>
                 ${longFieldsHTML ? `<div class="data-notes">${longFieldsHTML}</div>` : ''}
+                ${customFieldsSection}
               </div>
             </div>
           `;
@@ -2148,10 +2618,10 @@ class DashboardApp {
       try {
         matchNotesData = await api.getMatchNotes(this.currentEvent, { team: team.toString() });
       } catch (e) {
-        matchNotesData = this.getDemoNotesForTeam(team);
+        matchNotesData = this._isDevDataEvent() ? this.getDemoNotesForTeam(team) : { private_notes: [], public_notes: [] };
       }
       const hasRealNotes = (matchNotesData.private_notes?.length > 0 || matchNotesData.public_notes?.length > 0);
-      if (!hasRealNotes) {
+      if (!hasRealNotes && this._isDevDataEvent()) {
         matchNotesData = this.getDemoNotesForTeam(team);
       }
       allNotes = [
@@ -3542,12 +4012,12 @@ class DashboardApp {
     try {
       matchNotesData = await api.getMatchNotes(this.currentEvent, { team: teamNumber.toString() });
     } catch (e) {
-      // Fallback to demo notes
+      // Only fallback to demo notes for DEVDATA events
     }
     
-    // If no real notes, use demo notes
+    // If no real notes and this is a DEVDATA event, use demo notes
     const hasRealNotes = (matchNotesData.private_notes?.length > 0 || matchNotesData.public_notes?.length > 0);
-    if (!hasRealNotes) {
+    if (!hasRealNotes && this._isDevDataEvent()) {
       matchNotesData = this.getDemoNotesForTeam(teamNum);
     }
     
@@ -3713,9 +4183,9 @@ class DashboardApp {
       console.warn('Could not load match notes:', e);
     }
     
-    // Fallback to demo notes if no real notes
+    // Only fallback to demo notes for DEVDATA events
     const hasRealNotes = (existingNotes.private_notes?.length > 0 || existingNotes.public_notes?.length > 0);
-    if (!hasRealNotes) {
+    if (!hasRealNotes && this._isDevDataEvent()) {
       existingNotes = this.getDemoNotesForMatch(matchDescription);
     }
     
@@ -3747,7 +4217,7 @@ class DashboardApp {
         <div class="match-scout-team-card">
           <div class="match-scout-team-card-header ${team.alliance}">
             <div>
-              <span class="match-scout-team-card-name">Team ${team.number} ${isYourTeam ? '(You)' : ''}</span>
+              <span class="match-scout-team-card-name">Team ${team.number}${this.getTeamName(team.number) ? ' · ' + this.getTeamName(team.number) : ''} ${isYourTeam ? '(You)' : ''}</span>
             </div>
             <span class="match-scout-team-card-rank">${rankStr}</span>
           </div>
@@ -3795,14 +4265,14 @@ class DashboardApp {
             <span class="match-scout-alliance-label">Red</span>
             <span class="match-scout-alliance-score">${match.red.total ?? '-'}</span>
             <div class="match-scout-alliance-teams">
-              ${match.red.teams.map(t => `<span class="match-scout-alliance-team ${t.toString() === this.teamNumber ? 'highlight' : ''}">${t}</span>`).join('')}
+              ${match.red.teams.map(t => `<span class="match-scout-alliance-team ${t.toString() === this.teamNumber ? 'highlight' : ''}" title="${this.getTeamName(t)}">${t}</span>`).join('')}
             </div>
           </div>
           <div class="match-scout-alliance blue">
             <span class="match-scout-alliance-label">Blue</span>
             <span class="match-scout-alliance-score">${match.blue.total ?? '-'}</span>
             <div class="match-scout-alliance-teams">
-              ${match.blue.teams.map(t => `<span class="match-scout-alliance-team ${t.toString() === this.teamNumber ? 'highlight' : ''}">${t}</span>`).join('')}
+              ${match.blue.teams.map(t => `<span class="match-scout-alliance-team ${t.toString() === this.teamNumber ? 'highlight' : ''}" title="${this.getTeamName(t)}">${t}</span>`).join('')}
             </div>
           </div>
         </div>
@@ -3814,6 +4284,11 @@ class DashboardApp {
   }
   
   async saveMatchTeamNotes(matchDescription, teamNumber) {
+    if (this._isEventEnded()) {
+      toast.error('This event has ended — notes are read-only');
+      return;
+    }
+    
     const publicTextarea = document.querySelector(`.match-scout-note-input[data-match="${matchDescription}"][data-team="${teamNumber}"][data-private="0"]`);
     const privateTextarea = document.querySelector(`.match-scout-note-input[data-match="${matchDescription}"][data-team="${teamNumber}"][data-private="1"]`);
     
@@ -4075,7 +4550,9 @@ class DashboardApp {
       row.addEventListener('click', () => {
         const code = row.dataset.eventCode;
         const name = row.dataset.eventName;
-        this._selectEvent(code, name);
+        // Find the event metadata from the loaded list
+        const eventMeta = this._epAllEvents.find(e => e.code === code);
+        this._selectEvent(code, name, eventMeta);
       });
     });
   }
@@ -4122,10 +4599,20 @@ class DashboardApp {
     return div.innerHTML;
   }
   
-  async _selectEvent(code, name) {
+  async _selectEvent(code, name, eventMeta) {
     this.currentEvent = code;
     this.eventName = name || code;
     storage.set('currentEvent', code);
+    
+    // Store event metadata for end-date / status checks
+    if (eventMeta) {
+      this.eventDateEnd = eventMeta.dateEnd || null;
+      this.eventStatus = eventMeta.status || null;
+    } else {
+      this.eventDateEnd = null;
+      this.eventStatus = null;
+    }
+    this.eventEnded = false;
     
     // Update sidebar display
     const nameEl = $('#currentEventName');
@@ -4145,6 +4632,348 @@ class DashboardApp {
   }
   
   // ===================== End Event Picker =====================
+  
+  // ===================== Custom Questions =====================
+  
+  async loadCustomQuestions() {
+    try {
+      const data = await api.listCustomQuestions();
+      this.customQuestions = data.questions || [];
+    } catch (e) {
+      console.error('Failed to load custom questions:', e);
+      this.customQuestions = [];
+    }
+  }
+  
+  async renderCustomQuestionsManager() {
+    await this.loadCustomQuestions();
+    const container = $('#customQuestionsList');
+    if (!container) return;
+    
+    if (this.customQuestions.length === 0) {
+      container.innerHTML = `
+        <div class="empty-state" style="padding: var(--space-xl);">
+          <div class="empty-state-icon" data-icon="edit" data-icon-size="48"></div>
+          <div class="empty-state-title">No custom fields yet</div>
+          <div class="empty-state-text">Add boolean toggles, sliders, dropdowns, number fields, or text fields to your scouting form</div>
+        </div>
+      `;
+      initIcons();
+      return;
+    }
+    
+    const typeLabels = {
+      boolean: 'Toggle (Yes/No)',
+      slider: 'Slider',
+      dropdown: 'Dropdown',
+      number: 'Number',
+      text: 'Text'
+    };
+    
+    const typeColors = {
+      boolean: 'var(--success)',
+      slider: 'var(--primary)',
+      dropdown: 'var(--warning)',
+      number: 'var(--purple)',
+      text: 'var(--cyan, #06b6d4)'
+    };
+    
+    container.innerHTML = this.customQuestions.map((q, i) => {
+      let configDesc = '';
+      if (q.field_type === 'slider') {
+        configDesc = `Range: ${q.config.min ?? 0} – ${q.config.max ?? 10}, Step: ${q.config.step ?? 1}`;
+      } else if (q.field_type === 'dropdown') {
+        const opts = q.config.options || [];
+        configDesc = `Options: ${opts.join(', ')}`;
+      }
+      
+      return `
+        <div class="settings-row" style="align-items: center;">
+          <div class="settings-row-info" style="flex: 1;">
+            <h4 style="display: flex; align-items: center; gap: var(--space-sm);">
+              <span style="width: 8px; height: 8px; border-radius: 50%; background: ${typeColors[q.field_type] || 'var(--text-muted)'}; display: inline-block;"></span>
+              ${this._escapeHtml(q.label)}
+            </h4>
+            <p>
+              <span style="font-size: var(--text-xs); color: var(--text-muted);">${typeLabels[q.field_type] || q.field_type}</span>
+              ${configDesc ? `<span style="font-size: var(--text-xs); color: var(--text-muted); margin-left: var(--space-sm);">• ${this._escapeHtml(configDesc)}</span>` : ''}
+            </p>
+          </div>
+          <div style="display: flex; gap: var(--space-xs);">
+            <button class="btn btn-ghost btn-sm btn-icon" onclick="app.editCustomQuestion(${q.id})" title="Edit">
+              <span data-icon="edit" data-icon-size="14"></span>
+            </button>
+            <button class="btn btn-ghost btn-sm btn-icon" onclick="app.deleteCustomQuestion(${q.id})" title="Delete" style="color: var(--danger);">
+              <span data-icon="trash" data-icon-size="14"></span>
+            </button>
+          </div>
+        </div>
+      `;
+    }).join('');
+    
+    initIcons();
+  }
+  
+  setupCustomQuestionsListeners() {
+    $('#addCustomQuestionBtn')?.addEventListener('click', () => this.showCustomQuestionForm());
+    $('#cqSaveBtn')?.addEventListener('click', () => this.saveCustomQuestion());
+    $('#cqCancelBtn')?.addEventListener('click', () => this.hideCustomQuestionForm());
+    
+    // Toggle config sections based on field type
+    $('#cqFieldType')?.addEventListener('change', (e) => {
+      const type = e.target.value;
+      const sliderConfig = $('#cqSliderConfig');
+      const dropdownConfig = $('#cqDropdownConfig');
+      if (sliderConfig) sliderConfig.style.display = type === 'slider' ? 'block' : 'none';
+      if (dropdownConfig) dropdownConfig.style.display = type === 'dropdown' ? 'block' : 'none';
+    });
+  }
+  
+  showCustomQuestionForm(question = null) {
+    const form = $('#customQuestionForm');
+    if (!form) return;
+    
+    form.style.display = 'block';
+    
+    const titleEl = $('#cqFormTitle');
+    const labelInput = $('#cqLabel');
+    const typeSelect = $('#cqFieldType');
+    const editIdInput = $('#cqEditId');
+    const sliderConfig = $('#cqSliderConfig');
+    const dropdownConfig = $('#cqDropdownConfig');
+    
+    if (question) {
+      // Edit mode
+      if (titleEl) titleEl.textContent = 'Edit Custom Field';
+      if (labelInput) labelInput.value = question.label;
+      if (typeSelect) typeSelect.value = question.field_type;
+      if (editIdInput) editIdInput.value = question.id;
+      
+      if (question.field_type === 'slider') {
+        if (sliderConfig) sliderConfig.style.display = 'block';
+        if (dropdownConfig) dropdownConfig.style.display = 'none';
+        const minEl = $('#cqSliderMin');
+        const maxEl = $('#cqSliderMax');
+        const stepEl = $('#cqSliderStep');
+        if (minEl) minEl.value = question.config.min ?? 0;
+        if (maxEl) maxEl.value = question.config.max ?? 10;
+        if (stepEl) stepEl.value = question.config.step ?? 1;
+      } else if (question.field_type === 'dropdown') {
+        if (sliderConfig) sliderConfig.style.display = 'none';
+        if (dropdownConfig) dropdownConfig.style.display = 'block';
+        const optionsEl = $('#cqDropdownOptions');
+        if (optionsEl) optionsEl.value = (question.config.options || []).join('\n');
+      } else {
+        if (sliderConfig) sliderConfig.style.display = 'none';
+        if (dropdownConfig) dropdownConfig.style.display = 'none';
+      }
+    } else {
+      // Add mode
+      if (titleEl) titleEl.textContent = 'Add Custom Field';
+      if (labelInput) labelInput.value = '';
+      if (typeSelect) typeSelect.value = '';
+      if (editIdInput) editIdInput.value = '';
+      if (sliderConfig) sliderConfig.style.display = 'none';
+      if (dropdownConfig) dropdownConfig.style.display = 'none';
+    }
+    
+    form.scrollIntoView({ behavior: 'smooth' });
+    initIcons();
+  }
+  
+  hideCustomQuestionForm() {
+    const form = $('#customQuestionForm');
+    if (form) form.style.display = 'none';
+  }
+  
+  editCustomQuestion(id) {
+    const question = this.customQuestions.find(q => q.id === id);
+    if (question) {
+      this.showCustomQuestionForm(question);
+    }
+  }
+  
+  async deleteCustomQuestion(id) {
+    if (!confirm('Delete this custom field? All responses for this field will also be deleted.')) return;
+    
+    try {
+      await api.deleteCustomQuestion(id);
+      toast.success('Custom field deleted');
+      await this.renderCustomQuestionsManager();
+    } catch (e) {
+      console.error('Failed to delete custom question:', e);
+      toast.error('Failed to delete');
+    }
+  }
+  
+  async saveCustomQuestion() {
+    const label = $('#cqLabel')?.value?.trim();
+    const fieldType = $('#cqFieldType')?.value;
+    const editId = $('#cqEditId')?.value;
+    
+    if (!label) {
+      toast.error('Field label is required');
+      return;
+    }
+    if (!fieldType) {
+      toast.error('Please select a field type');
+      return;
+    }
+    
+    let config = {};
+    
+    if (fieldType === 'slider') {
+      config = {
+        min: parseFloat($('#cqSliderMin')?.value || '0'),
+        max: parseFloat($('#cqSliderMax')?.value || '10'),
+        step: parseFloat($('#cqSliderStep')?.value || '1'),
+      };
+      if (config.min >= config.max) {
+        toast.error('Max must be greater than min');
+        return;
+      }
+    } else if (fieldType === 'dropdown') {
+      const optionsText = $('#cqDropdownOptions')?.value || '';
+      const options = optionsText.split('\n').map(o => o.trim()).filter(o => o);
+      if (options.length < 2) {
+        toast.error('Please add at least 2 dropdown options');
+        return;
+      }
+      config = { options };
+    }
+    
+    const questionData = {
+      label,
+      field_type: fieldType,
+      config,
+      sort_order: editId ? undefined : this.customQuestions.length,
+    };
+    
+    if (editId) {
+      questionData.id = parseInt(editId);
+    }
+    
+    try {
+      await api.saveCustomQuestion(questionData);
+      toast.success(editId ? 'Custom field updated' : 'Custom field added');
+      this.hideCustomQuestionForm();
+      await this.renderCustomQuestionsManager();
+      // Refresh the scouting form if it's rendered
+      this.renderScoutCustomFields();
+    } catch (e) {
+      console.error('Failed to save custom question:', e);
+      toast.error('Failed to save');
+    }
+  }
+  
+  // ===================== Custom Fields on Scout Form =====================
+  
+  async renderScoutCustomFields() {
+    await this.loadCustomQuestions();
+    
+    const section = $('#scoutCustomFieldsSection');
+    const container = $('#scoutCustomFieldsContainer');
+    if (!section || !container) return;
+    
+    if (!this.customQuestions || this.customQuestions.length === 0) {
+      section.style.display = 'none';
+      return;
+    }
+    
+    section.style.display = 'block';
+    container.innerHTML = this.customQuestions.map(q => this.renderCustomFieldInput(q, 'cq_')).join('');
+    initIcons();
+  }
+  
+  renderCustomFieldInput(question, prefix = 'cq_') {
+    const id = `${prefix}${question.id}`;
+    
+    switch (question.field_type) {
+      case 'boolean':
+        return `
+          <div class="form-group">
+            <label class="checkbox-wrapper">
+              <input type="checkbox" name="${id}" id="${id}" data-cq-id="${question.id}">
+              <span>${this._escapeHtml(question.label)}</span>
+            </label>
+          </div>
+        `;
+        
+      case 'slider': {
+        const min = question.config.min ?? 0;
+        const max = question.config.max ?? 10;
+        const step = question.config.step ?? 1;
+        return `
+          <div class="form-group">
+            <label class="form-label">${this._escapeHtml(question.label)}</label>
+            <div class="slider-wrapper">
+              <input type="range" class="slider" name="${id}" id="${id}" data-cq-id="${question.id}"
+                     min="${min}" max="${max}" step="${step}" value="${min}"
+                     oninput="document.getElementById('${id}Value').textContent = this.value">
+              <span class="slider-value" id="${id}Value">${min}</span>
+            </div>
+          </div>
+        `;
+      }
+        
+      case 'dropdown': {
+        const options = question.config.options || [];
+        return `
+          <div class="form-group">
+            <label class="form-label">${this._escapeHtml(question.label)}</label>
+            <select class="form-input form-select" name="${id}" id="${id}" data-cq-id="${question.id}">
+              <option value="">Select...</option>
+              ${options.map(opt => `<option value="${this._escapeHtml(opt)}">${this._escapeHtml(opt)}</option>`).join('')}
+            </select>
+          </div>
+        `;
+      }
+        
+      case 'number':
+        return `
+          <div class="form-group">
+            <label class="form-label">${this._escapeHtml(question.label)}</label>
+            <input type="number" class="form-input" name="${id}" id="${id}" data-cq-id="${question.id}" min="0">
+          </div>
+        `;
+        
+      case 'text':
+        return `
+          <div class="form-group">
+            <label class="form-label">${this._escapeHtml(question.label)}</label>
+            <textarea class="form-input form-textarea" name="${id}" id="${id}" data-cq-id="${question.id}" rows="2"></textarea>
+          </div>
+        `;
+        
+      default:
+        return '';
+    }
+  }
+  
+  getCustomFieldValues() {
+    const responses = [];
+    if (!this.customQuestions) return responses;
+    
+    this.customQuestions.forEach(q => {
+      const el = $(`#cq_${q.id}`);
+      if (!el) return;
+      
+      let value = '';
+      if (q.field_type === 'boolean') {
+        value = el.checked ? 'true' : 'false';
+      } else if (el.type === 'range') {
+        value = el.value;
+      } else {
+        value = el.value || '';
+      }
+      
+      responses.push({ question_id: q.id, value });
+    });
+    
+    return responses;
+  }
+  
+  // ===================== End Custom Questions =====================
   
   async logout() {
     try {

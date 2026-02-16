@@ -10,15 +10,21 @@
   <meta http-equiv="Pragma" content="no-cache">
   <meta http-equiv="Expires" content="0">
   <title>WikiScout</title>
-  <link rel="stylesheet" href="css/variables.css">
-  <link rel="stylesheet" href="css/base.css">
-  <link rel="stylesheet" href="css/components.css">
-  <link rel="stylesheet" href="css/mobile.css">
+  <link rel="stylesheet" href="css/variables.css?v=1771097114">
+  <link rel="stylesheet" href="css/base.css?v=1771097114">
+  <link rel="stylesheet" href="css/components.css?v=1771097114">
+  <link rel="stylesheet" href="css/mobile.css?v=1771097114">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' fill='%2300d26a'/><text x='50' y='70' font-size='60' text-anchor='middle' fill='white' font-weight='bold'>W</text></svg>">
   <link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' fill='%2300d26a'/><text x='50' y='70' font-size='60' text-anchor='middle' fill='white' font-weight='bold'>W</text></svg>">
 </head>
 <body>
   <div class="mobile-layout">
+    <!-- Update Banner -->
+    <div class="update-banner" id="updateBanner" style="display:none;">
+      <span class="update-banner-text">A new version of WikiScout is available</span>
+      <button class="btn btn-sm btn-primary update-banner-btn" id="updateBannerBtn">Refresh</button>
+    </div>
+
     <!-- Loading Screen -->
     <div class="mobile-loading" id="loadingScreen">
       <div class="mobile-loading-spinner"></div>
@@ -32,6 +38,9 @@
         <div class="mobile-header-subtitle" id="mobileSubtitle">Team #---</div>
       </div>
       <div style="display: flex; gap: var(--space-sm);">
+        <button class="btn btn-icon btn-ghost" id="mobileRefreshBtn">
+          <span data-icon="refresh" data-icon-size="20"></span>
+        </button>
         <button class="btn btn-icon btn-ghost" id="mobileOtpBtn">
           <span data-icon="key" data-icon-size="20"></span>
         </button>
@@ -102,9 +111,13 @@
       <div class="screen" id="screen-data">
         <div class="team-selector">
           <label class="team-selector-label">Select Team</label>
-          <select class="form-input form-select" id="mobileTeamSelect">
-            <option value="">Choose team...</option>
-          </select>
+          <div class="custom-team-picker" id="dataTeamPicker">
+            <button type="button" class="custom-team-picker-trigger" id="dataTeamPickerBtn">
+              <span class="picker-trigger-text">Choose team...</span>
+              <span class="picker-trigger-chevron" data-icon="chevronDown" data-icon-size="16"></span>
+            </button>
+            <input type="hidden" id="mobileTeamSelect" value="">
+          </div>
         </div>
         
         <div id="mobileTeamData">
@@ -116,6 +129,33 @@
         </div>
       </div>
       
+      <!-- Team Screen (parent accounts only) -->
+      <div class="screen" id="screen-team">
+        <div class="team-mgmt-header">
+          <h2 class="team-mgmt-title">Team Members</h2>
+          <span class="team-mgmt-count" id="mobileTeamMemberCount">0</span>
+        </div>
+
+        <!-- Add Member Form -->
+        <div class="team-mgmt-add-card">
+          <form id="mobileAddMemberForm" class="team-mgmt-add-form">
+            <input type="text" class="form-input" id="mobileNewMemberName" placeholder="New member name..." autocomplete="off" required>
+            <button type="submit" class="btn btn-primary btn-sm" id="mobileAddMemberBtn">
+              <span data-icon="plus" data-icon-size="16"></span> Add
+            </button>
+          </form>
+        </div>
+
+        <!-- Member List -->
+        <div class="team-mgmt-list" id="mobileTeamMemberList">
+          <div class="empty-state">
+            <div class="empty-state-icon" data-icon="teams" data-icon-size="48"></div>
+            <div class="empty-state-title">No Members</div>
+            <div class="empty-state-text">Add scouts to your team to get started</div>
+          </div>
+        </div>
+      </div>
+
       <!-- Scout Screen -->
       <div class="screen" id="screen-scout">
         <!-- Event Banner -->
@@ -136,9 +176,13 @@
             <div class="scout-form-fields">
               <div class="scout-field">
                 <label class="scout-field-label">Team Number</label>
-                <select class="form-input form-select" id="mobileScoutTeam" required>
-                  <option value="">Select Team</option>
-                </select>
+                <div class="custom-team-picker" id="scoutTeamPicker">
+                  <button type="button" class="custom-team-picker-trigger" id="scoutTeamPickerBtn">
+                    <span class="picker-trigger-text">Select Team</span>
+                    <span class="picker-trigger-chevron" data-icon="chevronDown" data-icon-size="16"></span>
+                  </button>
+                  <input type="hidden" id="mobileScoutTeam" value="" required>
+                </div>
               </div>
             </div>
           </div>
@@ -146,7 +190,26 @@
           <!-- Dynamic form sections will be inserted here -->
           <div id="mobileFormFields"></div>
           
-          <button type="submit" class="btn btn-primary btn-lg scout-submit-float">Submit</button>
+          <!-- Custom Fields Section (loaded dynamically, private) -->
+          <div id="mobileCustomFieldsSection" style="display: none;">
+            <div class="scout-form-section">
+              <div class="scout-form-header" style="display: flex; align-items: center; gap: var(--space-sm);">
+                Custom Fields
+                <span class="badge badge-secondary" style="font-size: 10px;">Private</span>
+              </div>
+              <div class="scout-form-fields" id="mobileCustomFieldsContainer">
+                <!-- Custom fields rendered here -->
+              </div>
+            </div>
+          </div>
+          
+          <button type="submit" class="btn btn-primary btn-lg scout-submit-float" id="mobileScoutSubmitBtn">
+            <span class="scout-submit-text">Submit</span>
+            <span class="scout-submit-loading" style="display:none;">
+              <span class="mobile-loading-spinner" style="width:18px;height:18px;border-width:2px;"></span>
+              Saving...
+            </span>
+          </button>
         </form>
       </div>
       </main>
@@ -155,6 +218,10 @@
     <!-- Bottom Navigation Container -->
     <div class="mobile-nav-container">
       <nav class="mobile-nav">
+      <a href="#" class="mobile-nav-item" data-screen="team" id="mobileNavTeam" style="display: none;">
+        <span class="mobile-nav-icon" data-icon="teams"></span>
+        <span class="mobile-nav-label">Team</span>
+      </a>
       <a href="#" class="mobile-nav-item active" data-screen="rankings">
         <span class="mobile-nav-icon" data-icon="rankings"></span>
         <span class="mobile-nav-label">Rankings</span>
@@ -195,6 +262,25 @@
       </div>
       
       <div class="stats-played" id="statsPlayed">Matches Played: 0</div>
+      
+      <div class="stats-advanced" id="statsAdvanced" style="display: none;">
+        <div class="stats-advanced-row">
+          <div class="stats-advanced-item">
+            <div class="stats-advanced-label">OPR</div>
+            <div class="stats-advanced-value" id="statsOPR">—</div>
+            <div class="stats-advanced-rank" id="statsOPRRank"></div>
+          </div>
+          <div class="stats-advanced-item">
+            <div class="stats-advanced-label">Avg Score</div>
+            <div class="stats-advanced-value" id="statsAvgScore">—</div>
+          </div>
+          <div class="stats-advanced-item">
+            <div class="stats-advanced-label">Schedule</div>
+            <div class="stats-advanced-value" id="statsSoS">—</div>
+            <div class="stats-advanced-rank" id="statsSoSLabel"></div>
+          </div>
+        </div>
+      </div>
       
       <div class="stats-match-list" id="statsMatchList">
         <!-- Match results will be inserted here -->
@@ -238,8 +324,33 @@
     </div>
   </div>
 
+  <!-- Team Picker Bottom Sheet -->
+  <div class="team-picker-overlay" id="teamPickerOverlay"></div>
+  <div class="team-picker-sheet" id="teamPickerSheet">
+    <div class="team-picker-drag-handle"><div class="drag-handle-bar"></div></div>
+    <div class="team-picker-header">
+      <h3 class="team-picker-title">Select Team</h3>
+      <button type="button" class="btn btn-icon btn-ghost btn-sm" id="teamPickerClose">
+        <span data-icon="x" data-icon-size="20"></span>
+      </button>
+    </div>
+    <div class="team-picker-search">
+      <input type="text" class="form-input" id="teamPickerSearchInput" placeholder="Search by number or name..." autocomplete="off">
+    </div>
+    <div class="team-picker-legend">
+      <span class="team-picker-legend-item"><span class="tp-badge tp-badge-scouted"></span> Scouted</span>
+      <span class="team-picker-legend-item"><span class="tp-badge tp-badge-assigned"></span> Assigned</span>
+    </div>
+    <div class="team-picker-list" id="teamPickerList">
+      <!-- Filled by JS -->
+    </div>
+  </div>
+
   <!-- Match Scouting Bottom Sheet -->
   <div class="match-scout-sheet" id="matchScoutSheet">
+    <div class="match-scout-sheet-drag-handle" id="matchScoutDragHandle">
+      <div class="drag-handle-bar"></div>
+    </div>
     <div class="match-scout-sheet-header">
       <div>
         <h3 class="match-scout-sheet-title" id="matchScoutTitle">Qualifier 1</h3>
@@ -261,6 +372,112 @@
     </div>
   </div>
   <div class="match-scout-overlay" id="matchScoutOverlay"></div>
+
+  <!-- Member Detail Bottom Sheet -->
+  <div class="bottom-sheet" id="memberDetailSheet">
+    <div class="bottom-sheet-header">
+      <h3 class="bottom-sheet-title" id="memberDetailSheetName">Member</h3>
+      <button class="btn btn-icon btn-ghost btn-sm" id="closeMemberDetailSheet">
+        <span data-icon="x" data-icon-size="20"></span>
+      </button>
+    </div>
+    <div class="bottom-sheet-body">
+      <!-- Status & Info -->
+      <div class="tm-detail-info">
+        <div class="tm-detail-row">
+          <span class="tm-detail-label">Status</span>
+          <span class="tm-detail-value" id="memberDetailStatus">Active</span>
+        </div>
+        <div class="tm-detail-row">
+          <span class="tm-detail-label">Added</span>
+          <span class="tm-detail-value" id="memberDetailCreated">—</span>
+        </div>
+        <div class="tm-detail-row">
+          <span class="tm-detail-label">Last Login</span>
+          <span class="tm-detail-value" id="memberDetailLastLogin">Never</span>
+        </div>
+      </div>
+
+      <!-- Assigned Teams Section -->
+      <div class="tm-teams-section">
+        <div class="tm-detail-row" style="border-bottom: none;">
+          <span class="tm-detail-label">Assigned Teams</span>
+          <span class="tm-detail-value" id="memberDetailTeams">All teams</span>
+        </div>
+        <button class="btn btn-secondary btn-sm" id="memberEditTeamsBtn" style="width: 100%;">
+          <span data-icon="edit" data-icon-size="14"></span> Edit Assigned Teams
+        </button>
+      </div>
+
+      <!-- Credentials Section -->
+      <div class="tm-creds-section">
+        <div class="tm-creds-title">Login Credentials</div>
+        <div class="tm-otp-display" id="memberDetailOtp">
+          <div class="otp-digits" style="margin-bottom: var(--space-sm);">
+            <div class="otp-digit">-</div>
+            <div class="otp-digit">-</div>
+            <div class="otp-digit">-</div>
+            <div class="otp-dash">-</div>
+            <div class="otp-digit">-</div>
+            <div class="otp-digit">-</div>
+            <div class="otp-digit">-</div>
+          </div>
+        </div>
+        <div class="tm-creds-expire" id="memberDetailOtpExpiry"></div>
+        <div class="tm-creds-buttons">
+          <button class="btn btn-primary btn-sm" id="memberGenCredsBtn" style="flex: 1;">
+            <span data-icon="key" data-icon-size="14"></span> Generate
+          </button>
+          <button class="btn btn-secondary btn-sm" id="memberShowQrBtn" style="flex: 1;" disabled>
+            <span data-icon="qrcode" data-icon-size="14"></span> QR Code
+          </button>
+        </div>
+      </div>
+
+      <!-- Actions -->
+      <div class="tm-detail-actions">
+        <button class="btn btn-ghost btn-sm" id="memberToggleBtn" style="flex: 1;">
+          <span data-icon="pause" data-icon-size="14"></span> Deactivate
+        </button>
+        <button class="btn btn-danger btn-sm" id="memberDeleteBtn" style="flex: 1;">
+          <span data-icon="x" data-icon-size="14"></span> Remove
+        </button>
+      </div>
+    </div>
+  </div>
+  <div class="modal-overlay" id="memberDetailOverlay"></div>
+
+  <!-- Assign Teams Bottom Sheet -->
+  <div class="bottom-sheet" id="assignTeamsSheet">
+    <div class="bottom-sheet-header">
+      <h3 class="bottom-sheet-title">Assign Teams</h3>
+      <button class="btn btn-icon btn-ghost btn-sm" id="closeAssignTeamsSheet">
+        <span data-icon="x" data-icon-size="20"></span>
+      </button>
+    </div>
+    <div class="bottom-sheet-body">
+      <div class="at-search-row">
+        <input type="text" class="form-input" id="assignTeamsSearch" placeholder="Search teams..." autocomplete="off">
+      </div>
+      <label class="at-select-all">
+        <input type="checkbox" id="assignTeamsAllToggle"> <span>All Teams (no filter)</span>
+      </label>
+      <div class="at-team-list" id="assignTeamsList">
+        <!-- Checkboxes populated by JS -->
+      </div>
+      <button class="btn btn-primary" id="assignTeamsSaveBtn" style="width: 100%; margin-top: var(--space-md);">
+        Save
+      </button>
+    </div>
+  </div>
+  <div class="modal-overlay" id="assignTeamsOverlay"></div>
+
+  <!-- QR Code Enlarge Overlay -->
+  <div class="tm-qr-overlay" id="qrEnlargeOverlay" style="display: none;">
+    <div class="tm-qr-overlay-content" id="qrEnlargeContent">
+      <!-- Large QR inserted by JS -->
+    </div>
+  </div>
 
   <!-- OTP Bottom Sheet -->
   <div class="bottom-sheet" id="otpSheet">
@@ -297,10 +514,12 @@
   <div class="modal-overlay" id="otpSheetOverlay"></div>
 
   <!-- Scripts -->
-  <script src="js/view-detector.js"></script>
-  <script src="js/icons.js"></script>
-  <script src="js/utils.js"></script>
-  <script src="js/api.js"></script>
-  <script src="js/mobile-app.js"></script>
+  <script>var WIKISCOUT_BUILD = '1771097114';</script>
+  <script src="js/view-detector.js?v=1771097114"></script>
+  <script src="js/icons.js?v=1771097114"></script>
+  <script src="js/utils.js?v=1771097114"></script>
+  <script src="js/api.js?v=1771097114"></script>
+  <script src="js/version-check.js?v=1771097114"></script>
+  <script src="js/mobile-app.js?v=1771097114"></script>
 </body>
 </html>

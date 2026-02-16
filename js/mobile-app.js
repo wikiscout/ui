@@ -5,9 +5,23 @@ class MobileApp {
     this.currentEvent = null;
     this.teamNumber = null;
     this.teams = [];
+    this.teamNameMap = {};     // { teamNumber: nameShort } lookup
     this.rankings = [];
     this.matches = [];
     this.currentScreen = 'rankings';
+    this.isSubAccount = false;
+    this.assignedTeams = [];        // team numbers this sub-account is assigned to scout
+    this.scoutedTeams = [];         // team numbers already scouted at current event
+    this.oprData = [];              // calculated OPR data
+    this.sosData = [];              // calculated Strength of Schedule data
+    this._scoutFormDirty = false;   // tracks whether user has touched the scout form
+    this._scoutSubmitting = false;  // prevents double-submit
+    this._offlineQueueProcessing = false; // prevents concurrent queue processing
+    
+    // Auto-refresh config
+    this.autoRefreshInterval = 15000; // 15 seconds (overridden by server config)
+    this._refreshTimer = null;
+    this._silentRefreshing = false;
     
     this.init();
   }
@@ -26,6 +40,12 @@ class MobileApp {
     // Load initial data
     await this.loadInitialData();
     
+    // Start offline queue processor
+    this._startOfflineQueueProcessor();
+    
+    // Start auto-refresh
+    this._startAutoRefresh();
+    
     // Hide loading screen
     setTimeout(() => {
       $('#loadingScreen').style.display = 'none';
@@ -38,7 +58,15 @@ class MobileApp {
       if (result && result.team_number) {
         this.teamNumber = result.team_number.toString();
         this.userName = result.name || 'Team Member';
+        this.isSubAccount = !!result.is_sub_account;
+        this.assignedTeams = (result.assigned_teams || []).map(String);
         $('#mobileSubtitle').textContent = `Team #${this.teamNumber}`;
+        
+        // Show Team tab for parent accounts (not sub-accounts)
+        if (!this.isSubAccount) {
+          const teamNav = $('#mobileNavTeam');
+          if (teamNav) teamNav.style.display = '';
+        }
         return;
       }
     } catch (error) {
@@ -86,18 +114,31 @@ class MobileApp {
       rankings: 'Rankings',
       matches: 'Matches',
       data: 'Team Data',
-      scout: 'Scout'
+      scout: 'Scout',
+      team: 'Team Members'
     };
     $('#mobileTitle').textContent = titles[screen] || 'WikiScout';
     
     this.currentScreen = screen;
     this.loadScreenData(screen);
+
+    // When switching to scout tab, carry over the team selected on the data tab
+    if (screen === 'scout') {
+      const dataTeam = $('#mobileTeamSelect')?.value;
+      const scoutTeam = $('#mobileScoutTeam')?.value;
+      if (dataTeam && !scoutTeam) {
+        this._setScoutTeam(dataTeam);
+      }
+    }
     
     // Show/hide FAB
     $('#fabScout').style.display = screen !== 'scout' ? 'flex' : 'none';
   }
   
   setupEventListeners() {
+    // Refresh button in header
+    $('#mobileRefreshBtn')?.addEventListener('click', () => this.refreshData());
+
     // Logout button in header
     $('#mobileLogoutBtn')?.addEventListener('click', () => this.logout());
     
@@ -129,14 +170,32 @@ class MobileApp {
     // Match scouting sheet
     $('#closeMatchScoutSheet')?.addEventListener('click', () => this.closeMatchScoutSheet());
     $('#matchScoutOverlay')?.addEventListener('click', () => this.closeMatchScoutSheet());
+    this._setupMatchScoutSheetDrag();
     
-    // Team select for data view
-    $('#mobileTeamSelect').addEventListener('change', (e) => {
-      if (e.target.value) this.loadTeamData(e.target.value);
+    // Team pickers — open sheet
+    $('#dataTeamPickerBtn')?.addEventListener('click', () => this.openTeamPicker('data'));
+    $('#scoutTeamPickerBtn')?.addEventListener('click', () => this.openTeamPicker('scout'));
+
+    // Team picker sheet — close
+    $('#teamPickerClose')?.addEventListener('click', () => this.closeTeamPicker());
+    $('#teamPickerOverlay')?.addEventListener('click', () => this.closeTeamPicker());
+
+    // Team picker search
+    $('#teamPickerSearchInput')?.addEventListener('input', debounce((e) => {
+      this._renderPickerList(e.target.value);
+    }, 150));
+
+    // Team picker list click
+    $('#teamPickerList')?.addEventListener('click', (e) => {
+      const row = e.target.closest('.team-picker-row');
+      if (row) this._selectTeamFromPicker(row.dataset.team);
     });
     
     // Scout form
     $('#mobileScoutForm').addEventListener('submit', (e) => this.handleScoutSubmit(e));
+    // Track when user interacts with the scout form so we don't reset it
+    $('#mobileScoutForm').addEventListener('input', () => { this._scoutFormDirty = true; });
+    $('#mobileScoutForm').addEventListener('change', () => { this._scoutFormDirty = true; });
     
     // Stats popup buttons
     $('#statsViewData').addEventListener('click', () => this.viewTeamDataFromStats());
@@ -168,6 +227,22 @@ class MobileApp {
       this._mepSeason = parseInt(e.target.value);
       this._loadMobileEpData();
     });
+    
+    // Team management events
+    $('#mobileAddMemberForm')?.addEventListener('submit', (e) => this.handleAddMember(e));
+    $('#closeMemberDetailSheet')?.addEventListener('click', () => this.closeMemberDetail());
+    $('#memberDetailOverlay')?.addEventListener('click', () => this.closeMemberDetail());
+    $('#memberToggleBtn')?.addEventListener('click', () => this.toggleMember());
+    $('#memberDeleteBtn')?.addEventListener('click', () => this.deleteMember());
+    $('#memberGenCredsBtn')?.addEventListener('click', () => this.generateMemberCredentials());
+    $('#memberShowQrBtn')?.addEventListener('click', () => this.enlargeQr());
+    $('#qrEnlargeOverlay')?.addEventListener('click', () => this.closeEnlargedQr());
+    $('#memberEditTeamsBtn')?.addEventListener('click', () => this.openAssignTeamsSheet());
+    $('#closeAssignTeamsSheet')?.addEventListener('click', () => this.closeAssignTeamsSheet());
+    $('#assignTeamsOverlay')?.addEventListener('click', () => this.closeAssignTeamsSheet());
+    $('#assignTeamsSaveBtn')?.addEventListener('click', () => this.saveAssignedTeams());
+    $('#assignTeamsAllToggle')?.addEventListener('change', (e) => this.toggleAllTeams(e));
+    $('#assignTeamsSearch')?.addEventListener('input', (e) => this.filterAssignTeams(e));
   }
   
   async loadInitialData() {
@@ -178,23 +253,40 @@ class MobileApp {
         return { found: false };
       });
       
+      // Apply server-side config (auto-refresh interval, etc.)
+      if (meData.config) {
+        const interval = meData.config.mobile_refresh_interval;
+        this.autoRefreshInterval = (typeof interval === 'number' && interval >= 0) ? interval : 15000;
+      }
+
       if (meData.found && meData.event) {
+        // Store all events for division grouping
+        this._allTeamEvents = meData.allEvents || [];
+
+        // Auto-select division event: if the team has multiple active events
+        // where one code is a prefix of another, prefer the longer (division) code
+        const activeEvents = (meData.allEvents || []).filter(e => e.status === 'live');
+        if (activeEvents.length > 1) {
+          // Find events sharing a common prefix (division grouping)
+          const picked = this._pickDivisionEvent(activeEvents);
+          this.currentEvent = picked.code;
+          this.eventName = picked.name || picked.code;
+        } else {
         this.currentEvent = meData.event.code;
         this.eventName = meData.event.name || this.currentEvent;
+        }
         storage.set('currentEvent', this.currentEvent);
       } else {
         this.currentEvent = storage.get('currentEvent');
+        this._allTeamEvents = meData.allEvents || [];
       }
       
       // Load today's events
       const todayData = await api.getTodayEvents().catch(() => ({ events: [] }));
       
-      // If API fails, use demo event data
-      if (!todayData.events || todayData.events.length === 0) {
-        todayData.events = [
-          { code: '2026flwp', name: 'West Palm Beach Regional' },
-          { code: '2026txda', name: 'Dallas Regional' }
-        ];
+      // If no events today, leave the list empty — user can pick via event picker
+      if (!todayData.events) {
+        todayData.events = [];
       }
       
       // Events are selected via event picker modal, no need to populate a select
@@ -221,6 +313,31 @@ class MobileApp {
       console.error('Failed to load initial data:', error);
     }
   }
+
+  /**
+   * Given multiple active events, pick the best one (prefer division event).
+   * If a team is in USMNCMP and USMNCMPGLXY, pick USMNCMPGLXY (the division).
+   */
+  _pickDivisionEvent(activeEvents) {
+    if (activeEvents.length === 0) return activeEvents[0];
+    if (activeEvents.length === 1) return activeEvents[0];
+
+    // Sort by code length descending — longer code = more specific (division)
+    const sorted = [...activeEvents].sort((a, b) => b.code.length - a.code.length);
+
+    // Check if the longest code starts with any shorter code (indicates division)
+    for (const longer of sorted) {
+      for (const shorter of sorted) {
+        if (longer.code !== shorter.code && longer.code.startsWith(shorter.code)) {
+          // This is a division event — prefer it
+          return longer;
+        }
+      }
+    }
+
+    // No prefix relationship found — just pick the first active event
+    return sorted[0];
+  }
   
   updateEventBanners() {
     const name = this.eventName || this.currentEvent || 'No Event Selected';
@@ -237,19 +354,57 @@ class MobileApp {
     });
   }
   
+  _isDevDataEvent() {
+    return this.currentEvent && ['DEVDATA0', 'DEVDATA1'].includes(this.currentEvent.toUpperCase());
+  }
+
+  /** Get the short team name (or empty string) for a team number */
+  getTeamName(num) {
+    return this.teamNameMap[num] || this.teamNameMap[parseInt(num)] || '';
+  }
+
+  /** Return "TEAM_NUM · Name" if name exists, otherwise just "TEAM_NUM" */
+  teamLabel(num) {
+    const name = this.getTeamName(num);
+    return name ? `${num} · ${name}` : `${num}`;
+  }
+
+  _escapeHtml(str) {
+    if (!str) return '';
+    const div = document.createElement('div');
+    div.textContent = str;
+    return div.innerHTML;
+  }
+  
   async loadEventData() {
     if (!this.currentEvent) return;
     
+    // Reset all data before loading new event
+    this.teams = [];
+    this.teamNameMap = {};
+    this.rankings = [];
+    this.matches = [];
+    
     try {
-      const [teamsData, rankingsData, matchesData] = await Promise.all([
+      const [teamsData, rankingsData, matchesData, scoutedData] = await Promise.all([
         api.getTeams(this.currentEvent).catch(() => ({ teams: [] })),
         api.getRankings(this.currentEvent).catch(() => ({ rankings: [] })),
-        api.getMatches(this.currentEvent).catch(() => ({ matches: [] }))
+        api.getMatches(this.currentEvent).catch(() => ({ matches: [] })),
+        api.getScoutedTeams(this.currentEvent).catch(() => ({ scouted_teams: [] })),
       ]);
+      
+      // Store which teams have already been scouted
+      this.scoutedTeams = (scoutedData.scouted_teams || []).map(String);
       
       // Process teams
       if (teamsData && teamsData.teams && teamsData.teams.length > 0) {
         this.teams = teamsData.teams.map(t => t.teamNumber || t);
+        // Build team name lookup from API data
+        teamsData.teams.forEach(t => {
+          if (t.nameShort || t.nameFull) {
+            this.teamNameMap[t.teamNumber || t] = t.nameShort || t.nameFull || '';
+          }
+        });
       } else {
         this.teams = [];
       }
@@ -265,6 +420,12 @@ class MobileApp {
         ties: r.ties || 0,
         matchesPlayed: r.matchesPlayed || (r.wins + r.losses + r.ties) || 0
       }));
+      // Supplement name map from rankings
+      rankings.forEach(r => {
+        if (r.teamName && !this.teamNameMap[r.teamNumber]) {
+          this.teamNameMap[r.teamNumber] = r.teamName;
+        }
+      });
       
       // Process matches — API returns simplified format: { red: { total, auto, foul, teams }, blue: { ... } }
       const matches = matchesData.matches || matchesData.Schedule || [];
@@ -287,19 +448,91 @@ class MobileApp {
         }
       }));
       
-      // If API returned empty data (no auth / demo mode), generate client-side demo data
-      if (this.teams.length === 0 && this.rankings.length === 0 && this.matches.length === 0) {
+      // Only generate client-side demo data for DEVDATA events
+      if (this.teams.length === 0 && this.rankings.length === 0 && this.matches.length === 0 && this._isDevDataEvent()) {
         this._generateDemoData();
       }
       
+      this.calculateOPR();
+      this.calculateSoS();
       this.updateEventBanners();
       this.populateTeamSelects();
       this.renderRankings();
       this.renderMatches();
+      // Only render scout form if it hasn't been touched by the user
+      if (!this._scoutFormDirty) {
       this.renderScoutForm();
+      }
       
     } catch (error) {
       console.error('Failed to load event data:', error);
+    }
+  }
+
+  // ---- Refresh & Auto-Refresh ----
+
+  async refreshData() {
+    const btn = $('#mobileRefreshBtn');
+    if (btn) {
+      btn.disabled = true;
+      btn.innerHTML = '<span data-icon="refresh" data-icon-size="20" class="spin"></span>';
+      initIcons();
+    }
+
+    try {
+      await this.loadEventData();
+      toast.success('Data refreshed');
+    } catch (e) {
+      toast.error('Failed to refresh data');
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.innerHTML = '<span data-icon="refresh" data-icon-size="20"></span>';
+        initIcons();
+      }
+    }
+  }
+
+  _startAutoRefresh() {
+    this._stopAutoRefresh();
+    if (this.autoRefreshInterval > 0) {
+      this._refreshTimer = setInterval(() => this._silentRefresh(), this.autoRefreshInterval);
+    }
+  }
+
+  _stopAutoRefresh() {
+    if (this._refreshTimer) {
+      clearInterval(this._refreshTimer);
+      this._refreshTimer = null;
+    }
+  }
+
+  async _silentRefresh() {
+    if (!this.currentEvent) return;
+    if (this._silentRefreshing) return;
+
+    // Only auto-refresh on data-display screens, NOT on scouting form or data view
+    const refreshScreens = ['rankings', 'matches'];
+    if (!refreshScreens.includes(this.currentScreen)) return;
+
+    this._silentRefreshing = true;
+
+    const btn = $('#mobileRefreshBtn');
+    if (btn) {
+      btn.innerHTML = '<span data-icon="refresh" data-icon-size="20" class="spin"></span>';
+      initIcons();
+    }
+
+    try {
+      await this.loadEventData();
+    } catch (e) {
+      console.warn('Silent refresh failed:', e);
+    } finally {
+      this._silentRefreshing = false;
+      if (btn) {
+        btn.innerHTML = '<span data-icon="refresh" data-icon-size="20"></span>';
+        initIcons();
+      }
     }
   }
   
@@ -411,17 +644,195 @@ class MobileApp {
   }
 
   populateTeamSelects() {
-    ['#mobileTeamSelect', '#mobileScoutTeam'].forEach(selector => {
-      const select = $(selector);
-      if (select) {
-        const currentValue = select.value;
-        select.innerHTML = '<option value="">Select Team</option>' +
-          this.teams.map(t => `<option value="${t}">${t}</option>`).join('');
-        if (currentValue && this.teams.includes(parseInt(currentValue))) {
-          select.value = currentValue;
-        }
+    // Update custom picker trigger labels if a value was already selected
+    ['mobileTeamSelect', 'mobileScoutTeam'].forEach(hiddenId => {
+      const hidden = $(`#${hiddenId}`);
+      if (!hidden) return;
+      const val = hidden.value;
+      const triggerBtn = hiddenId === 'mobileTeamSelect' ? $('#dataTeamPickerBtn') : $('#scoutTeamPickerBtn');
+      if (!triggerBtn) return;
+      const textEl = triggerBtn.querySelector('.picker-trigger-text');
+      if (val && this.teams.includes(parseInt(val))) {
+        textEl.textContent = this.teamLabel(val);
+        textEl.classList.remove('placeholder');
+        this._updatePickerTriggerBadges(triggerBtn, val);
+      } else {
+        textEl.textContent = hiddenId === 'mobileTeamSelect' ? 'Choose team...' : 'Select Team';
+        textEl.classList.add('placeholder');
+        // Remove old badges
+        const oldBadges = triggerBtn.querySelector('.picker-trigger-badges');
+        if (oldBadges) oldBadges.remove();
       }
     });
+  }
+
+  // ─── Custom Team Picker Sheet ───────────────────────────────────
+
+  _activePickerTarget = null; // 'data' or 'scout'
+
+  openTeamPicker(target) {
+    this._activePickerTarget = target;
+    const sheet = $('#teamPickerSheet');
+    const overlay = $('#teamPickerOverlay');
+    if (!sheet || !overlay) return;
+
+    // Set title
+    const title = $('#teamPickerTitle');
+    if (title) title.textContent = target === 'scout' ? 'Select Team to Scout' : 'Select Team';
+
+    // Render list
+    this._renderPickerList('');
+
+    // Show
+    overlay.classList.add('active');
+    sheet.classList.add('active');
+
+    // Clear search but do NOT auto-focus (avoids keyboard popping up on mobile)
+    const searchInput = $('#teamPickerSearchInput');
+    if (searchInput) searchInput.value = '';
+  }
+
+  closeTeamPicker() {
+    const sheet = $('#teamPickerSheet');
+    const overlay = $('#teamPickerOverlay');
+    if (sheet) sheet.classList.remove('active');
+    if (overlay) overlay.classList.remove('active');
+    this._activePickerTarget = null;
+  }
+
+  _renderPickerList(query) {
+    const container = $('#teamPickerList');
+    if (!container) return;
+
+    const q = (query || '').trim().toLowerCase();
+    const hiddenId = this._activePickerTarget === 'scout' ? 'mobileScoutTeam' : 'mobileTeamSelect';
+    const currentVal = $(`#${hiddenId}`)?.value || '';
+
+    // Sort: assigned first, then unscouted, then scouted
+    const sorted = [...this.teams].sort((a, b) => {
+      const aAssigned = this.assignedTeams.includes(String(a));
+      const bAssigned = this.assignedTeams.includes(String(b));
+      const aScouted = this.scoutedTeams.includes(String(a));
+      const bScouted = this.scoutedTeams.includes(String(b));
+
+      // Assigned unscouted first
+      if (aAssigned && !aScouted && !(bAssigned && !bScouted)) return -1;
+      if (bAssigned && !bScouted && !(aAssigned && !aScouted)) return 1;
+      // Then assigned scouted
+      if (aAssigned && !bAssigned) return -1;
+      if (bAssigned && !aAssigned) return 1;
+      // Then unscouted
+      if (!aScouted && bScouted) return -1;
+      if (aScouted && !bScouted) return 1;
+      return a - b;
+    });
+
+    const filtered = sorted.filter(t => {
+      if (!q) return true;
+      const name = (this.getTeamName(t) || '').toLowerCase();
+      return String(t).includes(q) || name.includes(q);
+    });
+
+    if (filtered.length === 0) {
+      container.innerHTML = '<div class="team-picker-empty">No teams found</div>';
+      return;
+    }
+
+    container.innerHTML = filtered.map(t => {
+      const num = String(t);
+      const name = this.getTeamName(t) || '';
+      const isScouted = this.scoutedTeams.includes(num);
+      const isAssigned = this.isSubAccount && this.assignedTeams.includes(num);
+      const isSelected = num === currentVal;
+
+      let badges = '';
+      if (isScouted) badges += '<span class="tp-pill tp-pill-scouted">Scouted</span>';
+      if (isAssigned) badges += '<span class="tp-pill tp-pill-assigned">Assigned</span>';
+
+      return `
+        <div class="team-picker-row${isSelected ? ' selected' : ''}" data-team="${num}">
+          <span class="team-picker-row-number">${num}</span>
+          <span class="team-picker-row-name">${this._escapeHtml(name)}</span>
+          <span class="team-picker-row-badges">${badges}</span>
+          <span class="team-picker-row-check">✓</span>
+        </div>`;
+    }).join('');
+  }
+
+  _selectTeamFromPicker(teamNumber) {
+    const target = this._activePickerTarget;
+    this.closeTeamPicker();
+
+    if (target === 'scout') {
+      this._setScoutTeam(teamNumber);
+    } else {
+      // Data tab
+      const hidden = $('#mobileTeamSelect');
+      if (hidden) hidden.value = teamNumber;
+      const triggerBtn = $('#dataTeamPickerBtn');
+      if (triggerBtn) {
+        const textEl = triggerBtn.querySelector('.picker-trigger-text');
+        if (textEl) {
+          textEl.textContent = this.teamLabel(teamNumber);
+          textEl.classList.remove('placeholder');
+        }
+        this._updatePickerTriggerBadges(triggerBtn, teamNumber);
+      }
+      this.loadTeamData(teamNumber);
+    }
+  }
+
+  /** Programmatically set the scout team picker value, update trigger UI, and autofill */
+  _setScoutTeam(teamNumber) {
+    const hidden = $('#mobileScoutTeam');
+    if (hidden) hidden.value = teamNumber;
+
+    const triggerBtn = $('#scoutTeamPickerBtn');
+    if (triggerBtn) {
+      const textEl = triggerBtn.querySelector('.picker-trigger-text');
+      if (textEl) {
+        textEl.textContent = this.teamLabel(teamNumber);
+        textEl.classList.remove('placeholder');
+      }
+      this._updatePickerTriggerBadges(triggerBtn, teamNumber);
+    }
+
+    this._scoutFormDirty = true;
+    this.autofillMobileScoutForm(teamNumber);
+  }
+
+  _updatePickerTriggerBadges(triggerBtn, teamNumber) {
+    // Remove old badges container
+    const oldBadges = triggerBtn.querySelector('.picker-trigger-badges');
+    if (oldBadges) oldBadges.remove();
+
+    const num = String(teamNumber);
+    const isScouted = this.scoutedTeams.includes(num);
+    const isAssigned = this.isSubAccount && this.assignedTeams.includes(num);
+
+    if (!isScouted && !isAssigned) return;
+
+    const badgesEl = document.createElement('span');
+    badgesEl.className = 'picker-trigger-badges';
+    if (isScouted) {
+      const dot = document.createElement('span');
+      dot.className = 'tp-badge tp-badge-scouted';
+      dot.title = 'Already scouted';
+      badgesEl.appendChild(dot);
+        }
+    if (isAssigned) {
+      const dot = document.createElement('span');
+      dot.className = 'tp-badge tp-badge-assigned';
+      dot.title = 'Assigned to you';
+      badgesEl.appendChild(dot);
+    }
+    // Insert before chevron
+    const chevron = triggerBtn.querySelector('.picker-trigger-chevron');
+    if (chevron) {
+      triggerBtn.insertBefore(badgesEl, chevron);
+    } else {
+      triggerBtn.appendChild(badgesEl);
+    }
   }
   
   loadScreenData(screen) {
@@ -434,6 +845,9 @@ class MobileApp {
         break;
       case 'matches':
         this.renderMatches();
+        break;
+      case 'team':
+        this.loadTeamMembers();
         break;
     }
   }
@@ -454,21 +868,174 @@ class MobileApp {
       return;
     }
     
-    container.innerHTML = this.rankings.map(team => `
+    // Build quick lookups for OPR and SoS
+    const oprMap = {};
+    this.oprData.forEach(o => { oprMap[o.teamNumber] = o; });
+    const sosMap = {};
+    this.sosData.forEach(s => { sosMap[s.teamNumber] = s; });
+    const hasAdvanced = this.oprData.length > 0;
+    
+    container.innerHTML = this.rankings.map(team => {
+      const isMyTeam = team.teamNumber.toString() === this.teamNumber;
+      const opr = oprMap[team.teamNumber];
+      const sos = sosMap[team.teamNumber];
+      
+      // Build stats pills
+      let statsPills = '';
+      if (hasAdvanced) {
+        if (opr) {
+          statsPills += `<span class="ranking-pill ranking-pill-opr">${opr.opr.toFixed(1)} OPR</span>`;
+        }
+        if (sos) {
+          const sosClass = sos.sos > 2 ? 'sos-lucky' : sos.sos < -2 ? 'sos-unlucky' : 'sos-neutral';
+          statsPills += `<span class="ranking-pill ${sosClass}">${sos.sos > 0 ? '+' : ''}${sos.sos.toFixed(1)} SoS</span>`;
+        }
+      }
+      
+      return `
       <div class="ranking-item" onclick="mobileApp.showTeamStats(${team.teamNumber})">
         <div class="ranking-position ${this.getRankClass(team.rank)}">${team.rank}</div>
         <div class="ranking-info">
-          <div class="ranking-team ${team.teamNumber.toString() === this.teamNumber ? 'text-primary' : ''}">
-            Team ${team.teamNumber}
+          <div class="ranking-team ${isMyTeam ? 'text-primary' : ''}">
+            <span class="ranking-team-num">${team.teamNumber}</span>${this.getTeamName(team.teamNumber) ? `<span class="ranking-team-name">· ${this.getTeamName(team.teamNumber)}</span>` : ''}
           </div>
-          <div class="ranking-record">${team.wins}W - ${team.losses}L - ${team.ties}T</div>
-        </div>
-        <div class="ranking-stat">
-          <div class="ranking-stat-value">${team.matchesPlayed}</div>
-          <div class="ranking-stat-label">Played</div>
+          <div class="ranking-record">${team.wins}W - ${team.losses}L - ${team.ties}T · ${team.matchesPlayed} played</div>
+          ${statsPills ? `<div class="ranking-pills">${statsPills}</div>` : ''}
         </div>
       </div>
-    `).join('');
+    `}).join('');
+  }
+  
+  // ===================== OPR & SoS Calculations =====================
+  
+  calculateOPR() {
+    this.oprData = [];
+    
+    const completedMatches = this.matches.filter(m =>
+      m.completed &&
+      m.red?.score != null &&
+      m.blue?.score != null &&
+      m.red?.teams?.length > 0 &&
+      m.blue?.teams?.length > 0
+    );
+    
+    if (completedMatches.length < 3 || this.teams.length === 0) return;
+    
+    // Build team index mapping
+    const teamIndex = {};
+    this.teams.forEach((team, i) => { teamIndex[team] = i; });
+    
+    const n = this.teams.length;
+    
+    // Initialize matrices for least squares: (A^T * A) * x = A^T * b
+    const ATA = Array(n).fill(0).map(() => Array(n).fill(0));
+    const ATb = Array(n).fill(0);
+    
+    completedMatches.forEach(match => {
+      const redTeams = match.red.teams.filter(t => teamIndex[t] !== undefined);
+      const blueTeams = match.blue.teams.filter(t => teamIndex[t] !== undefined);
+      
+      if (redTeams.length === 0 || blueTeams.length === 0) return;
+      
+      const redScore = match.red.score;
+      const blueScore = match.blue.score;
+      
+      // Red alliance equation
+      redTeams.forEach(t1 => {
+        const i1 = teamIndex[t1];
+        ATb[i1] += redScore;
+        redTeams.forEach(t2 => { ATA[i1][teamIndex[t2]] += 1; });
+      });
+      
+      // Blue alliance equation
+      blueTeams.forEach(t1 => {
+        const i1 = teamIndex[t1];
+        ATb[i1] += blueScore;
+        blueTeams.forEach(t2 => { ATA[i1][teamIndex[t2]] += 1; });
+      });
+    });
+    
+    // Solve using Gauss-Seidel iteration
+    const opr = Array(n).fill(0);
+    const totalScores = completedMatches.reduce((sum, m) => sum + m.red.score + m.blue.score, 0);
+    const avgScore = totalScores / (completedMatches.length * 2 * (completedMatches[0]?.red?.teams?.length || 2));
+    opr.fill(avgScore);
+    
+    for (let iter = 0; iter < 100; iter++) {
+      let maxChange = 0;
+      for (let i = 0; i < n; i++) {
+        if (ATA[i][i] === 0) continue;
+        let sum = ATb[i];
+        for (let j = 0; j < n; j++) {
+          if (i !== j) sum -= ATA[i][j] * opr[j];
+        }
+        const newVal = sum / ATA[i][i];
+        maxChange = Math.max(maxChange, Math.abs(newVal - opr[i]));
+        opr[i] = newVal;
+      }
+      if (maxChange < 0.01) break;
+    }
+    
+    this.teams.forEach((team, i) => {
+      this.oprData.push({ teamNumber: team, opr: opr[i] || 0 });
+    });
+    
+    this.oprData.sort((a, b) => b.opr - a.opr);
+    this.oprData.forEach((team, i) => { team.rank = i + 1; });
+  }
+  
+  calculateSoS() {
+    this.sosData = [];
+    if (this.oprData.length === 0) return;
+    
+    const oprLookup = {};
+    this.oprData.forEach(t => { oprLookup[t.teamNumber] = t.opr; });
+    
+    this.teams.forEach(team => {
+      let partnerOPRSum = 0;
+      let opponentOPRSum = 0;
+      let partnerCount = 0;
+      let opponentCount = 0;
+      let matchCount = 0;
+      
+      this.matches.forEach(match => {
+        if (!match.completed) return;
+        
+        const redTeams = match.red?.teams || [];
+        const blueTeams = match.blue?.teams || [];
+        
+        const isOnRed = redTeams.includes(team) || redTeams.includes(parseInt(team));
+        const isOnBlue = blueTeams.includes(team) || blueTeams.includes(parseInt(team));
+        
+        if (!isOnRed && !isOnBlue) return;
+        matchCount++;
+        
+        if (isOnRed) {
+          redTeams.forEach(t => { if (t != team && oprLookup[t] !== undefined) { partnerOPRSum += oprLookup[t]; partnerCount++; } });
+          blueTeams.forEach(t => { if (oprLookup[t] !== undefined) { opponentOPRSum += oprLookup[t]; opponentCount++; } });
+        } else {
+          blueTeams.forEach(t => { if (t != team && oprLookup[t] !== undefined) { partnerOPRSum += oprLookup[t]; partnerCount++; } });
+          redTeams.forEach(t => { if (oprLookup[t] !== undefined) { opponentOPRSum += oprLookup[t]; opponentCount++; } });
+        }
+      });
+      
+      if (matchCount === 0) return;
+      
+      const avgPartnerOPR = partnerCount > 0 ? partnerOPRSum / partnerCount : 0;
+      const avgOpponentOPR = opponentCount > 0 ? opponentOPRSum / opponentCount : 0;
+      const sos = avgPartnerOPR - avgOpponentOPR;
+      
+      this.sosData.push({
+        teamNumber: team,
+        sos,
+        avgPartnerOPR,
+        avgOpponentOPR,
+        matchCount
+      });
+    });
+    
+    this.sosData.sort((a, b) => b.sos - a.sos);
+    this.sosData.forEach((team, i) => { team.rank = i + 1; });
   }
   
   renderMatches() {
@@ -696,7 +1263,7 @@ class MobileApp {
     const alliancesEl = $('#matchScoutAlliances');
     if (alliancesEl) {
       const renderTeams = (teams) => teams.map(t => 
-        `<span class="${t === myTeam ? 'highlight' : ''}">${t}</span>`
+        `<span class="${t === myTeam ? 'highlight' : ''}" title="${this.getTeamName(t)}">${t}</span>`
       ).join(' ');
       
       alliancesEl.innerHTML = `
@@ -758,7 +1325,7 @@ class MobileApp {
         <div class="ms-team-card">
           <div class="ms-team-card-header ${team.alliance}">
             <div class="ms-team-card-name">
-              Team ${team.number}
+              Team ${team.number}${this.getTeamName(team.number) ? ' · ' + this.getTeamName(team.number) : ''}
               ${isYourTeam ? '<span class="ms-team-you-badge">YOU</span>' : ''}
             </div>
             <span class="ms-team-card-rank">${rankStr}</span>
@@ -847,9 +1414,74 @@ class MobileApp {
   }
   
   closeMatchScoutSheet() {
-    $('#matchScoutSheet')?.classList.remove('open');
+    const sheet = $('#matchScoutSheet');
+    if (sheet) {
+      sheet.classList.remove('open', 'dragging');
+      sheet.style.transform = '';
+    }
     $('#matchScoutOverlay')?.classList.remove('active');
     document.body.style.overflow = '';
+  }
+
+  _setupMatchScoutSheetDrag() {
+    const sheet = $('#matchScoutSheet');
+    const handle = $('#matchScoutDragHandle');
+    const header = sheet?.querySelector('.match-scout-sheet-header');
+    if (!sheet) return;
+
+    let startY = 0;
+    let currentY = 0;
+    let isDragging = false;
+
+    const onTouchStart = (e) => {
+      // Only initiate drag if the sheet is scrolled to the top
+      if (sheet.scrollTop > 5) return;
+      startY = e.touches[0].clientY;
+      currentY = 0;
+      isDragging = true;
+      sheet.classList.add('dragging');
+    };
+
+    const onTouchMove = (e) => {
+      if (!isDragging) return;
+      currentY = e.touches[0].clientY - startY;
+      if (currentY < 0) currentY = 0; // Don't allow dragging up
+      if (currentY > 0) {
+        e.preventDefault(); // Prevent scrolling while dragging down
+        sheet.style.transform = `translateY(${currentY}px)`;
+        // Fade overlay proportionally
+        const overlay = $('#matchScoutOverlay');
+        if (overlay) {
+          const progress = Math.min(currentY / 300, 1);
+          overlay.style.opacity = 1 - progress;
+        }
+      }
+    };
+
+    const onTouchEnd = () => {
+      if (!isDragging) return;
+      isDragging = false;
+      sheet.classList.remove('dragging');
+      sheet.style.transform = '';
+      const overlay = $('#matchScoutOverlay');
+      if (overlay) overlay.style.opacity = '';
+
+      // If dragged more than 120px or 30% of sheet height, dismiss
+      const threshold = Math.min(120, sheet.offsetHeight * 0.3);
+      if (currentY > threshold) {
+        this.closeMatchScoutSheet();
+      }
+    };
+
+    // Attach to handle and header for easy grab area
+    [handle, header].forEach(el => {
+      if (!el) return;
+      el.addEventListener('touchstart', onTouchStart, { passive: true });
+    });
+
+    // Move and end on sheet itself so dragging anywhere works after start
+    sheet.addEventListener('touchmove', onTouchMove, { passive: false });
+    sheet.addEventListener('touchend', onTouchEnd, { passive: true });
   }
   
   // ===================== Match Notes in Team Data View =====================
@@ -951,11 +1583,11 @@ class MobileApp {
           <div class="mn-expand">
             <div class="mn-alliances">
               <div class="mn-alliance red">
-                ${match.red.teams.map(t => `<span class="${t === teamNum ? 'mn-team-highlight' : ''}">${t}</span>`).join(' ')}
+                ${match.red.teams.map(t => `<span class="${t === teamNum ? 'mn-team-highlight' : ''}" title="${this.getTeamName(t)}">${t}</span>`).join(' ')}
               </div>
               <span class="mn-alliance-vs">vs</span>
               <div class="mn-alliance blue">
-                ${match.blue.teams.map(t => `<span class="${t === teamNum ? 'mn-team-highlight' : ''}">${t}</span>`).join(' ')}
+                ${match.blue.teams.map(t => `<span class="${t === teamNum ? 'mn-team-highlight' : ''}" title="${this.getTeamName(t)}">${t}</span>`).join(' ')}
               </div>
             </div>
             ${noteCount > 0 ? `
@@ -994,11 +1626,57 @@ class MobileApp {
     
     // Populate popup
     $('#statsTeamTitle').textContent = `Team ${teamNumber}`;
-    $('#statsTeamName').textContent = team.teamName || '';
+    $('#statsTeamName').textContent = this.getTeamName(teamNumber) || team.teamName || '';
     $('#statsWins').textContent = team.wins;
     $('#statsTies').textContent = team.ties;
     $('#statsLosses').textContent = team.losses;
     $('#statsPlayed').textContent = `Matches Played: ${team.matchesPlayed}`;
+    
+    // Populate OPR & SoS advanced stats
+    const oprEntry = this.oprData.find(o => o.teamNumber == teamNumber);
+    const sosEntry = this.sosData.find(s => s.teamNumber == teamNumber);
+    const advancedEl = $('#statsAdvanced');
+    
+    if (oprEntry || sosEntry) {
+      if (advancedEl) advancedEl.style.display = '';
+      
+      if (oprEntry) {
+        $('#statsOPR').textContent = oprEntry.opr.toFixed(1);
+        $('#statsOPRRank').textContent = `#${oprEntry.rank} of ${this.oprData.length}`;
+      } else {
+        $('#statsOPR').textContent = '—';
+        $('#statsOPRRank').textContent = '';
+      }
+      
+      // Calculate average score per match
+      const teamMatches = this.matches.filter(m => m.completed && (
+        m.red.teams.includes(teamNumber) || m.blue.teams.includes(teamNumber) ||
+        m.red.teams.includes(parseInt(teamNumber)) || m.blue.teams.includes(parseInt(teamNumber))
+      ));
+      if (teamMatches.length > 0) {
+        const totalScore = teamMatches.reduce((sum, m) => {
+          const isRed = m.red.teams.includes(teamNumber) || m.red.teams.includes(parseInt(teamNumber));
+          return sum + (isRed ? m.red.score : m.blue.score);
+        }, 0);
+        $('#statsAvgScore').textContent = (totalScore / teamMatches.length).toFixed(1);
+      } else {
+        $('#statsAvgScore').textContent = '—';
+      }
+      
+      if (sosEntry) {
+        const sosVal = sosEntry.sos;
+        const sosEl = $('#statsSoS');
+        sosEl.textContent = `${sosVal > 0 ? '+' : ''}${sosVal.toFixed(1)}`;
+        sosEl.className = 'stats-advanced-value ' + (sosVal > 2 ? 'sos-lucky' : sosVal < -2 ? 'sos-unlucky' : 'sos-neutral');
+        const label = sosVal > 2 ? 'Easy' : sosVal < -2 ? 'Hard' : 'Fair';
+        $('#statsSoSLabel').textContent = label;
+      } else {
+        $('#statsSoS').textContent = '—';
+        $('#statsSoSLabel').textContent = '';
+      }
+    } else {
+      if (advancedEl) advancedEl.style.display = 'none';
+    }
     
     // Load match history
     this.loadMatchHistory(teamNumber);
@@ -1137,7 +1815,7 @@ class MobileApp {
         <div class="team-view-header">
           <div class="team-view-number">${team}</div>
           <div class="team-view-info">
-            <h2>Team ${team}</h2>
+            <h2>Team ${team}${this.getTeamName(team) ? ' · ' + this.getTeamName(team) : ''}</h2>
             <div class="team-view-badges">
               <span class="badge badge-secondary">#${teamRank?.rank || 'N/A'}</span>
               <span class="badge badge-primary">${teamRank ? `${teamRank.wins}W` : 'N/A'}</span>
@@ -1150,6 +1828,41 @@ class MobileApp {
           </div>
         </div>
       `;
+      
+      // Pre-fetch custom field responses (private to this team)
+      let customFieldRows = '';
+      try {
+        const cqData = await api.getCustomResponses(team, this.currentEvent);
+        if (cqData?.questions && cqData.questions.length > 0) {
+          customFieldRows = cqData.questions.map(q => {
+            let displayValue = q.value ?? '-';
+            if (q.field_type === 'boolean') {
+              if (q.value === 'true') displayValue = 'Yes';
+              else if (q.value === 'false') displayValue = 'No';
+              else displayValue = '-';
+            } else if ((q.field_type === 'number' || q.field_type === 'slider') && (q.value === null || q.value === '')) {
+              displayValue = '-';
+            } else if (!q.value) { displayValue = '-'; }
+            return `
+              <div class="data-row">
+                <span class="data-row-label">${q.label}</span>
+                <span class="data-row-value ${this.formatValue(displayValue).isCheck ? 'check' : ''}">${this.formatValue(displayValue).display}</span>
+              </div>
+            `;
+          }).join('');
+        }
+      } catch (e) {
+        console.warn('Failed to load custom responses:', e);
+      }
+      
+      const customFieldsSection = customFieldRows ? `
+        <div style="border-top: 1px solid var(--border-color, rgba(255,255,255,0.1)); margin-top: 8px; padding-top: 8px;">
+          <div style="font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; display: flex; align-items: center; gap: 4px;">
+            Custom Fields <span class="badge badge-primary" style="font-size: 9px; padding: 1px 6px;">Private</span>
+          </div>
+          ${customFieldRows}
+        </div>
+      ` : '';
       
       // Your data - highlighted section
       if (data.private_data?.data?.length) {
@@ -1167,13 +1880,27 @@ class MobileApp {
                   </span>
                 </div>
               `).join('')}
+              ${customFieldsSection}
+            </div>
+          </div>
+        `;
+      } else if (customFieldRows) {
+        // No standard data but has custom fields — show them in a card
+        html += `
+          <div class="data-section my-data">
+            <div class="data-section-header">
+              <span class="data-section-title">Scouting Data</span>
+            </div>
+            <div class="data-section-body">
+              <div style="padding: 8px 0; color: var(--text-muted); font-size: 13px;">No standard fields submitted</div>
+              ${customFieldsSection}
             </div>
           </div>
         `;
       }
       
       // Divider between your data and other data
-      if (data.private_data?.data?.length && data.public_data?.length) {
+      if ((data.private_data?.data?.length || customFieldRows) && data.public_data?.length) {
         html += `<div class="data-divider">Other Teams' Data</div>`;
       }
       
@@ -1333,16 +2060,84 @@ class MobileApp {
     }
     
     container.innerHTML = html;
+    
+    // Render custom fields after the standard form
+    this.renderMobileCustomFields();
+  }
+  
+  async autofillMobileScoutForm(teamNumber) {
+    if (!teamNumber || !this.currentEvent) return;
+    try {
+      const [data, customResponses] = await Promise.all([
+        api.getScoutingData(teamNumber, this.currentEvent).catch(() => null),
+        api.getCustomResponses(teamNumber, this.currentEvent).catch(() => null),
+      ]);
+
+      // Fill standard fields
+      if (data && data.private_data && data.private_data.data) {
+        const formData = data.private_data.data;
+        const fields = ['mecanum', 'driverPractice', 'teleOpBalls', 'shootingDist',
+                        'autoBalls', 'autoShooting', 'autoPoints', 'autoLeave',
+                        'autoDetails', 'privateNotes'];
+        fields.forEach((fieldId, i) => {
+          const el = $(`#m${fieldId}`);
+          if (el && formData[i] !== undefined) {
+            if (el.type === 'checkbox') {
+              el.checked = (formData[i] === true || formData[i] === 'true');
+            } else if (el.type === 'range') {
+              el.value = formData[i];
+              const valSpan = $(`#m${fieldId}Value`);
+              if (valSpan) valSpan.textContent = formData[i];
+            } else {
+              el.value = formData[i];
+            }
+          }
+        });
+      }
+
+      // Fill custom fields
+      if (customResponses && customResponses.questions) {
+        customResponses.questions.forEach(q => {
+          const el = $(`#mcq_${q.id}`);
+          if (el && q.value !== null) {
+            if (q.field_type === 'boolean') {
+              el.checked = (q.value === 'true');
+            } else if (el.type === 'range') {
+              el.value = q.value;
+              const valSpan = $(`#mcq_${q.id}Value`);
+              if (valSpan) valSpan.textContent = q.value;
+            } else {
+              el.value = q.value;
+            }
+          }
+        });
+      }
+    } catch (e) {
+      console.warn('Mobile autofill failed:', e);
+    }
   }
   
   async handleScoutSubmit(e) {
     e.preventDefault();
+    
+    // Prevent double-submit
+    if (this._scoutSubmitting) return;
     
     const team = $('#mobileScoutTeam').value;
     if (!team || !this.currentEvent) {
       toast.error('Select a team first');
       return;
     }
+    
+    const submitBtn = $('#mobileScoutSubmitBtn');
+    const submitText = submitBtn?.querySelector('.scout-submit-text');
+    const submitLoading = submitBtn?.querySelector('.scout-submit-loading');
+    
+    // Show loading state
+    this._scoutSubmitting = true;
+    if (submitBtn) submitBtn.disabled = true;
+    if (submitText) submitText.style.display = 'none';
+    if (submitLoading) submitLoading.style.display = 'inline-flex';
     
     const fields = ['mecanum', 'driverPractice', 'teleOpBalls', 'shootingDist',
                    'autoBalls', 'autoShooting', 'autoPoints', 'autoLeave',
@@ -1356,15 +2151,210 @@ class MobileApp {
       return '';
     });
     
+    // Collect custom field values before any reset
+    const customResponses = this.getMobileCustomFieldValues();
+    
+    // Build the entry with a timestamp for ordering
+    const entry = {
+      team,
+      event: this.currentEvent,
+      formData,
+      customResponses,
+      timestamp: Date.now(),
+    };
+    
+    // Retry logic for reliability (quick retries)
+    const MAX_RETRIES = 2;
+    let saved = false;
+    let lastError = null;
+    
+    for (let attempt = 0; attempt <= MAX_RETRIES && !saved; attempt++) {
     try {
       await api.addScoutingData(team, this.currentEvent, formData);
-      toast.success('Data saved!');
-      e.target.reset();
-      $$('.slider-value').forEach(el => el.textContent = '0');
-    } catch (error) {
-      toast.error('Failed to save');
-      console.error(error);
+        saved = true;
+      } catch (error) {
+        lastError = error;
+        console.error(`Scout data save attempt ${attempt + 1} failed:`, error);
+        if (attempt < MAX_RETRIES) {
+          await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
+        }
+      }
     }
+    
+    if (saved) {
+      // Also save custom responses
+      if (customResponses.length > 0) {
+        try {
+          await api.saveCustomResponses(team, this.currentEvent, customResponses);
+        } catch (err) {
+          // Queue custom responses for retry
+          this._queueOfflineEntry({ ...entry, type: 'custom_only' });
+          console.error('Custom responses queued for retry:', err);
+        }
+      }
+      toast.success(`Data saved for Team ${team}!`);
+      // Add to scouted teams list so the picker updates
+      if (!this.scoutedTeams.includes(String(team))) {
+        this.scoutedTeams.push(String(team));
+      }
+    } else {
+      // Queue the full entry for background retry
+      this._queueOfflineEntry({ ...entry, type: 'full' });
+      toast.warning(`Saved offline — will auto-sync for Team ${team}`);
+      console.error('All immediate attempts failed, queued for retry:', lastError);
+    }
+    
+    // Always reset the form so the user can keep scouting
+      e.target.reset();
+    // Reset the hidden input and trigger button for team picker
+    const hiddenTeam = $('#mobileScoutTeam');
+    if (hiddenTeam) hiddenTeam.value = '';
+    const scoutTrigger = $('#scoutTeamPickerBtn');
+    if (scoutTrigger) {
+      const trigText = scoutTrigger.querySelector('.picker-trigger-text');
+      if (trigText) { trigText.textContent = 'Select Team'; trigText.classList.add('placeholder'); }
+      const oldBadges = scoutTrigger.querySelector('.picker-trigger-badges');
+      if (oldBadges) oldBadges.remove();
+    }
+      $$('.slider-value').forEach(el => el.textContent = '0');
+    this._scoutFormDirty = false;
+    this.renderMobileCustomFields();
+    
+    // Restore button state
+    this._scoutSubmitting = false;
+    if (submitBtn) submitBtn.disabled = false;
+    if (submitText) submitText.style.display = '';
+    if (submitLoading) submitLoading.style.display = 'none';
+  }
+
+  // ===================== Offline Save Queue =====================
+
+  _getOfflineQueue() {
+    try {
+      return JSON.parse(localStorage.getItem('wikiscout_offline_queue') || '[]');
+    } catch {
+      return [];
+    }
+  }
+
+  _saveOfflineQueue(queue) {
+    try {
+      localStorage.setItem('wikiscout_offline_queue', JSON.stringify(queue));
+    } catch (e) {
+      console.error('Failed to write offline queue to localStorage:', e);
+    }
+  }
+
+  _queueOfflineEntry(entry) {
+    const queue = this._getOfflineQueue();
+    
+    // Deduplicate: if there's already a queued entry for the same team+event,
+    // only keep the newer one (higher timestamp)
+    const existingIdx = queue.findIndex(
+      q => q.team === entry.team && q.event === entry.event && q.type === entry.type
+    );
+    if (existingIdx !== -1) {
+      if (queue[existingIdx].timestamp >= entry.timestamp) {
+        // Existing entry is newer or same — don't overwrite
+        return;
+      }
+      queue.splice(existingIdx, 1);
+    }
+    
+    queue.push(entry);
+    this._saveOfflineQueue(queue);
+    this._updateOfflineQueueBadge();
+  }
+
+  _updateOfflineQueueBadge() {
+    const queue = this._getOfflineQueue();
+    let badge = $('#offlineQueueBadge');
+    if (queue.length > 0) {
+      if (!badge) {
+        // Create a small floating badge to show pending items
+        badge = document.createElement('div');
+        badge.id = 'offlineQueueBadge';
+        badge.style.cssText = `
+          position: fixed; top: 8px; right: 8px; z-index: 9999;
+          background: var(--warning, #f59e0b); color: #000;
+          font-size: 11px; font-weight: 700;
+          padding: 4px 10px; border-radius: 999px;
+          box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+          pointer-events: none;
+        `;
+        document.body.appendChild(badge);
+      }
+      badge.textContent = `${queue.length} pending`;
+      badge.style.display = '';
+    } else if (badge) {
+      badge.style.display = 'none';
+    }
+  }
+
+  _startOfflineQueueProcessor() {
+    // Process immediately on start, then every 10 seconds
+    this._processOfflineQueue();
+    this._offlineQueueTimer = setInterval(() => this._processOfflineQueue(), 10000);
+    
+    // Also process when coming back online
+    window.addEventListener('online', () => {
+      console.log('[OfflineQueue] Network restored, processing queue...');
+      this._processOfflineQueue();
+    });
+    
+    // Show badge on load if there are pending items
+    this._updateOfflineQueueBadge();
+  }
+
+  async _processOfflineQueue() {
+    if (this._offlineQueueProcessing) return;
+    
+    const queue = this._getOfflineQueue();
+    if (queue.length === 0) return;
+    
+    this._offlineQueueProcessing = true;
+    
+    // Sort by timestamp ascending — process oldest first
+    queue.sort((a, b) => a.timestamp - b.timestamp);
+    
+    const remaining = [];
+    
+    for (const entry of queue) {
+      // Before pushing, check if there's a more recent entry for the same team+event
+      // already in the remaining queue (which would have been successfully saved already).
+      // If so, skip the older one.
+      const hasNewerInQueue = queue.some(
+        q => q !== entry && q.team === entry.team && q.event === entry.event
+             && q.type === entry.type && q.timestamp > entry.timestamp
+      );
+      if (hasNewerInQueue) {
+        console.log(`[OfflineQueue] Skipping stale entry for Team ${entry.team} (newer version exists)`);
+        continue; // Drop this older entry
+      }
+      
+      try {
+        if (entry.type === 'full') {
+          await api.addScoutingData(entry.team, entry.event, entry.formData);
+          // Also push custom responses if any
+          if (entry.customResponses && entry.customResponses.length > 0) {
+            await api.saveCustomResponses(entry.team, entry.event, entry.customResponses).catch(() => {});
+          }
+        } else if (entry.type === 'custom_only') {
+          await api.saveCustomResponses(entry.team, entry.event, entry.customResponses);
+        }
+        
+        // Success!
+        toast.success(`Data saved for Team ${entry.team}`);
+        console.log(`[OfflineQueue] Successfully synced entry for Team ${entry.team}`);
+      } catch (e) {
+        console.warn(`[OfflineQueue] Retry failed for Team ${entry.team}:`, e);
+        remaining.push(entry); // Keep for next attempt
+      }
+    }
+    
+    this._saveOfflineQueue(remaining);
+    this._updateOfflineQueueBadge();
+    this._offlineQueueProcessing = false;
   }
   
   async loadOtp() {
@@ -1682,6 +2672,609 @@ class MobileApp {
     `;
   }
   
+  // ===================== Custom Fields =====================
+  
+  async loadCustomQuestions() {
+    try {
+      const data = await api.listCustomQuestions();
+      this.customQuestions = data.questions || [];
+    } catch (e) {
+      console.error('Failed to load custom questions:', e);
+      this.customQuestions = [];
+    }
+  }
+  
+  async renderMobileCustomFields() {
+    await this.loadCustomQuestions();
+    
+    const section = $('#mobileCustomFieldsSection');
+    const container = $('#mobileCustomFieldsContainer');
+    if (!section || !container) return;
+    
+    if (!this.customQuestions || this.customQuestions.length === 0) {
+      section.style.display = 'none';
+      return;
+    }
+    
+    section.style.display = 'block';
+    container.innerHTML = this.customQuestions.map(q => this._renderMobileCustomField(q)).join('');
+  }
+  
+  _renderMobileCustomField(question) {
+    const id = `mcq_${question.id}`;
+    
+    switch (question.field_type) {
+      case 'boolean':
+        return `
+          <div class="scout-field">
+            <div class="scout-field-row">
+              <label class="scout-field-label">${question.label}</label>
+              <input type="checkbox" class="checkbox" name="${id}" id="${id}" data-cq-id="${question.id}">
+            </div>
+          </div>
+        `;
+        
+      case 'slider': {
+        const min = question.config.min ?? 0;
+        const max = question.config.max ?? 10;
+        const step = question.config.step ?? 1;
+        return `
+          <div class="scout-field">
+            <label class="scout-field-label">${question.label}</label>
+            <div class="slider-wrapper">
+              <input type="range" class="slider" name="${id}" id="${id}" data-cq-id="${question.id}"
+                     min="${min}" max="${max}" step="${step}" value="${min}"
+                     oninput="document.getElementById('${id}Value').textContent = this.value">
+              <span class="slider-value" id="${id}Value">${min}</span>
+            </div>
+          </div>
+        `;
+      }
+        
+      case 'dropdown': {
+        const options = question.config.options || [];
+        return `
+          <div class="scout-field">
+            <label class="scout-field-label">${question.label}</label>
+            <select class="form-input form-select" name="${id}" id="${id}" data-cq-id="${question.id}">
+              <option value="">Select...</option>
+              ${options.map(opt => `<option value="${opt}">${opt}</option>`).join('')}
+            </select>
+          </div>
+        `;
+      }
+        
+      case 'number':
+        return `
+          <div class="scout-field">
+            <label class="scout-field-label">${question.label}</label>
+            <input type="number" class="form-input" name="${id}" id="${id}" data-cq-id="${question.id}" min="0" inputmode="numeric">
+          </div>
+        `;
+        
+      case 'text':
+        return `
+          <div class="scout-field">
+            <label class="scout-field-label">${question.label}</label>
+            <textarea class="form-input form-textarea" name="${id}" id="${id}" data-cq-id="${question.id}" rows="2"></textarea>
+          </div>
+        `;
+        
+      default:
+        return '';
+    }
+  }
+  
+  getMobileCustomFieldValues() {
+    const responses = [];
+    if (!this.customQuestions) return responses;
+    
+    this.customQuestions.forEach(q => {
+      const el = $(`#mcq_${q.id}`);
+      if (!el) return;
+      
+      let value = '';
+      if (q.field_type === 'boolean') {
+        value = el.checked ? 'true' : 'false';
+      } else if (el.type === 'range') {
+        value = el.value;
+      } else {
+        value = el.value || '';
+      }
+      
+      responses.push({ question_id: q.id, value });
+    });
+    
+    return responses;
+  }
+  
+  // ===================== End Custom Fields =====================
+  
+  // ==========================================
+  // Team Members (Sub-Accounts) Methods
+  // ==========================================
+
+  async loadTeamMembers() {
+    try {
+      const data = await api.listSubAccounts();
+      this.subAccounts = data.sub_accounts || [];
+      this.renderTeamMembers();
+      
+      const countEl = $('#mobileTeamMemberCount');
+      if (countEl) countEl.textContent = this.subAccounts.length;
+    } catch (error) {
+      console.error('Failed to load team members:', error);
+      const list = $('#mobileTeamMemberList');
+      if (list) {
+        if (error.status === 403) {
+          list.innerHTML = `
+            <div class="empty-state">
+              <div class="empty-state-icon" data-icon="alert" data-icon-size="48"></div>
+              <div class="empty-state-title">Access Denied</div>
+              <div class="empty-state-text">Only the main account can manage team members</div>
+            </div>
+          `;
+        } else {
+          list.innerHTML = `
+            <div class="empty-state">
+              <div class="empty-state-icon" data-icon="alert" data-icon-size="48"></div>
+              <div class="empty-state-title">Error</div>
+              <div class="empty-state-text">Failed to load team members</div>
+            </div>
+          `;
+        }
+        initIcons();
+      }
+    }
+  }
+
+  renderTeamMembers() {
+    const container = $('#mobileTeamMemberList');
+    if (!container) return;
+
+    if (this.subAccounts.length === 0) {
+      container.innerHTML = `
+        <div class="empty-state">
+          <div class="empty-state-icon" data-icon="teams" data-icon-size="48"></div>
+          <div class="empty-state-title">No Members</div>
+          <div class="empty-state-text">Add scouts to your team to get started</div>
+        </div>
+      `;
+      initIcons();
+      return;
+    }
+
+    container.innerHTML = this.subAccounts.map(member => {
+      const initial = member.name.charAt(0).toUpperCase();
+      const teamsText = member.assigned_teams && member.assigned_teams.length > 0
+        ? `Teams: ${member.assigned_teams.join(', ')}`
+        : 'All teams';
+      
+      return `
+        <div class="tm-card ${!member.is_active ? 'inactive' : ''}" onclick="mobileApp.openMemberDetail(${member.id})">
+          <div class="tm-avatar">${initial}</div>
+          <div class="tm-info">
+            <div class="tm-name">${this._escapeHtml(member.name)}</div>
+            <div class="tm-meta">${teamsText}</div>
+          </div>
+          <div class="tm-status-dot ${member.is_active ? 'active' : 'inactive'}"></div>
+        </div>
+      `;
+    }).join('');
+  }
+
+  async handleAddMember(e) {
+    e.preventDefault();
+    
+    const nameInput = $('#mobileNewMemberName');
+    const btn = $('#mobileAddMemberBtn');
+    const name = nameInput?.value?.trim();
+    
+    if (!name) {
+      toast.error('Please enter a name');
+      return;
+    }
+    
+    if (btn) {
+      btn.disabled = true;
+      btn.innerHTML = '<span class="mobile-loading-spinner" style="width:14px;height:14px;border-width:2px;"></span>';
+    }
+    
+    try {
+      await api.createSubAccount(name, []);
+      toast.success(`Added ${name}`);
+      if (nameInput) nameInput.value = '';
+      await this.loadTeamMembers();
+    } catch (error) {
+      console.error('Failed to add member:', error);
+      toast.error('Failed to add member');
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.innerHTML = '<span data-icon="plus" data-icon-size="16"></span> Add';
+        initIcons();
+      }
+    }
+  }
+
+  openMemberDetail(memberId) {
+    const member = (this.subAccounts || []).find(m => m.id === memberId);
+    if (!member) return;
+    
+    this._selectedMemberId = memberId;
+    
+    // Populate sheet
+    const nameEl = $('#memberDetailSheetName');
+    if (nameEl) nameEl.textContent = member.name;
+    
+    const statusEl = $('#memberDetailStatus');
+    if (statusEl) {
+      statusEl.textContent = member.is_active ? 'Active' : 'Inactive';
+      statusEl.style.color = member.is_active ? 'var(--success, #22c55e)' : 'var(--text-muted)';
+    }
+    
+    const createdEl = $('#memberDetailCreated');
+    if (createdEl) {
+      try {
+        createdEl.textContent = new Date(member.created_at).toLocaleDateString();
+      } catch { createdEl.textContent = '—'; }
+    }
+    
+    const lastLoginEl = $('#memberDetailLastLogin');
+    if (lastLoginEl) {
+      if (member.last_login && member.last_login !== member.created_at) {
+        const d = new Date(member.last_login);
+        lastLoginEl.textContent = d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+      } else {
+        lastLoginEl.textContent = 'Never';
+      }
+    }
+    
+    // Assigned teams display
+    const teamsEl = $('#memberDetailTeams');
+    if (teamsEl) {
+      teamsEl.textContent = member.assigned_teams && member.assigned_teams.length > 0
+        ? member.assigned_teams.join(', ')
+        : 'All teams';
+    }
+    
+    // Reset QR state
+    this._memberLoginUrl = null;
+    const qrBtn = $('#memberShowQrBtn');
+    if (qrBtn) qrBtn.disabled = true;
+    
+    // Toggle button text
+    const toggleBtn = $('#memberToggleBtn');
+    if (toggleBtn) {
+      toggleBtn.innerHTML = member.is_active
+        ? '<span data-icon="pause" data-icon-size="14"></span> Deactivate'
+        : '<span data-icon="check" data-icon-size="14"></span> Activate';
+      initIcons();
+    }
+    
+    // Load credentials
+    this.loadMemberCredentials(memberId);
+    
+    // Open sheet
+    const sheet = $('#memberDetailSheet');
+    const overlay = $('#memberDetailOverlay');
+    if (sheet) sheet.classList.add('open');
+    if (overlay) overlay.classList.add('active');
+  }
+
+  closeMemberDetail() {
+    const sheet = $('#memberDetailSheet');
+    const overlay = $('#memberDetailOverlay');
+    if (sheet) sheet.classList.remove('open');
+    if (overlay) overlay.classList.remove('active');
+    this._selectedMemberId = null;
+  }
+
+  async toggleMember() {
+    if (!this._selectedMemberId) return;
+    const member = (this.subAccounts || []).find(m => m.id === this._selectedMemberId);
+    if (!member) return;
+    
+    const btn = $('#memberToggleBtn');
+    if (btn) btn.disabled = true;
+    
+    try {
+      const newState = !member.is_active;
+      await api.updateSubAccount(this._selectedMemberId, { is_active: newState });
+      toast.success(`${member.name} ${newState ? 'activated' : 'deactivated'}`);
+      await this.loadTeamMembers();
+      // Re-open with updated data
+      this.openMemberDetail(this._selectedMemberId);
+    } catch (error) {
+      console.error('Failed to toggle member:', error);
+      toast.error('Failed to update member');
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  async deleteMember() {
+    if (!this._selectedMemberId) return;
+    const member = (this.subAccounts || []).find(m => m.id === this._selectedMemberId);
+    if (!member) return;
+    
+    if (!confirm(`Remove ${member.name}? This cannot be undone.`)) return;
+    
+    const btn = $('#memberDeleteBtn');
+    if (btn) btn.disabled = true;
+    
+    try {
+      await api.deleteSubAccount(this._selectedMemberId);
+      toast.success(`${member.name} removed`);
+      this.closeMemberDetail();
+      await this.loadTeamMembers();
+    } catch (error) {
+      console.error('Failed to delete member:', error);
+      toast.error('Failed to remove member');
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  async loadMemberCredentials(memberId) {
+    const otpContainer = $('#memberDetailOtp');
+    const expiryEl = $('#memberDetailOtpExpiry');
+    const qrBtn = $('#memberShowQrBtn');
+    
+    try {
+      const data = await api.getSubAccountCredentials(memberId);
+      
+      if (data.otp_code) {
+        this._renderMemberOtp(otpContainer, data.otp_code);
+        if (expiryEl && data.expires_at) {
+          const expires = new Date(data.expires_at);
+          const now = new Date();
+          const hoursLeft = Math.max(0, Math.round((expires - now) / 1000 / 60 / 60));
+          expiryEl.textContent = hoursLeft > 0 ? `Expires in ~${hoursLeft}h` : 'Expired';
+        }
+      } else {
+        this._renderMemberOtp(otpContainer, '------');
+        if (expiryEl) expiryEl.textContent = '';
+      }
+      
+      // Enable QR button if token available
+      if (data.token) {
+        this._memberLoginUrl = `${window.location.origin}/code.html?token=${data.token}`;
+        if (qrBtn) qrBtn.disabled = false;
+      } else {
+        this._memberLoginUrl = null;
+        if (qrBtn) qrBtn.disabled = true;
+      }
+    } catch (error) {
+      console.error('Failed to load credentials:', error);
+      this._renderMemberOtp(otpContainer, '------');
+      if (expiryEl) expiryEl.textContent = 'Click Generate to create credentials';
+      this._memberLoginUrl = null;
+      if (qrBtn) qrBtn.disabled = true;
+    }
+  }
+
+  _renderMemberOtp(container, code) {
+    if (!container) return;
+    const digits = (code || '------').replace(/[^0-9a-zA-Z]/g, '').split('');
+    while (digits.length < 6) digits.push('-');
+    
+    const left = digits.slice(0, 3);
+    const right = digits.slice(3, 6);
+    
+    container.innerHTML = `
+      <div class="otp-digits" style="margin-bottom: var(--space-sm);">
+        ${left.map(d => `<div class="otp-digit ${d !== '-' ? 'filled' : ''}">${d}</div>`).join('')}
+        <div class="otp-dash">-</div>
+        ${right.map(d => `<div class="otp-digit ${d !== '-' ? 'filled' : ''}">${d}</div>`).join('')}
+      </div>
+    `;
+  }
+
+  async generateMemberCredentials() {
+    if (!this._selectedMemberId) return;
+    
+    const btn = $('#memberGenCredsBtn');
+    if (btn) {
+      btn.disabled = true;
+      btn.innerHTML = '<span class="mobile-loading-spinner" style="width:14px;height:14px;border-width:2px;"></span> Generating...';
+    }
+    
+    try {
+      const data = await api.regenerateSubAccountCredentials(this._selectedMemberId);
+      
+      if (data.otp_code) {
+        this._renderMemberOtp($('#memberDetailOtp'), data.otp_code);
+        const expiryEl = $('#memberDetailOtpExpiry');
+        if (expiryEl && data.expires_at) {
+          const expires = new Date(data.expires_at);
+          const now = new Date();
+          const hoursLeft = Math.max(0, Math.round((expires - now) / 1000 / 60 / 60));
+          expiryEl.textContent = hoursLeft > 0 ? `Expires in ~${hoursLeft}h` : 'Expired';
+        }
+      }
+      
+      // Enable QR button
+      if (data.token) {
+        this._memberLoginUrl = `${window.location.origin}/code.html?token=${data.token}`;
+        const qrBtn = $('#memberShowQrBtn');
+        if (qrBtn) qrBtn.disabled = false;
+      }
+      
+      toast.success('Credentials generated');
+    } catch (error) {
+      console.error('Failed to generate credentials:', error);
+      toast.error('Failed to generate credentials');
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.innerHTML = '<span data-icon="key" data-icon-size="14"></span> Generate';
+        initIcons();
+      }
+    }
+  }
+
+  // QR enlarge/close
+  enlargeQr() {
+    if (!this._memberLoginUrl) return;
+    const overlay = $('#qrEnlargeOverlay');
+    const content = $('#qrEnlargeContent');
+    if (overlay && content) {
+      content.innerHTML = `<img src="https://api.qrserver.com/v1/create-qr-code/?size=480x480&data=${encodeURIComponent(this._memberLoginUrl)}" alt="QR Code">`;
+      overlay.style.display = 'flex';
+    }
+  }
+
+  closeEnlargedQr() {
+    const overlay = $('#qrEnlargeOverlay');
+    if (overlay) overlay.style.display = 'none';
+  }
+
+  // --- Assign Teams Sheet ---
+  openAssignTeamsSheet() {
+    if (!this._selectedMemberId) return;
+    const member = (this.subAccounts || []).find(m => m.id === this._selectedMemberId);
+    if (!member) return;
+
+    const assignedSet = new Set((member.assigned_teams || []).map(String));
+    const isAll = assignedSet.size === 0;
+
+    // Build the team list from event rankings data
+    const allTeams = (this.rankings || []).map(r => ({
+      number: String(r.teamNumber),
+      name: this.getTeamName(r.teamNumber) || '',
+    }));
+
+    // If there are no rankings, fall back to any teams we know about
+    if (allTeams.length === 0 && this.teams) {
+      Object.entries(this.teams).forEach(([num, info]) => {
+        allTeams.push({ number: String(num), name: info.name || info.nameShort || '' });
+      });
+    }
+
+    // Sort numerically
+    allTeams.sort((a, b) => parseInt(a.number) - parseInt(b.number));
+    this._assignTeamsList = allTeams;
+
+    // Set "All" toggle
+    const allToggle = $('#assignTeamsAllToggle');
+    if (allToggle) allToggle.checked = isAll;
+
+    // Clear search
+    const searchInput = $('#assignTeamsSearch');
+    if (searchInput) searchInput.value = '';
+
+    // Render checklist
+    this._renderAssignTeamsList(allTeams, assignedSet, isAll);
+
+    // Show sheet
+    const sheet = $('#assignTeamsSheet');
+    const overlay = $('#assignTeamsOverlay');
+    if (sheet) sheet.classList.add('open');
+    if (overlay) overlay.classList.add('active');
+  }
+
+  closeAssignTeamsSheet() {
+    const sheet = $('#assignTeamsSheet');
+    const overlay = $('#assignTeamsOverlay');
+    if (sheet) sheet.classList.remove('open');
+    if (overlay) overlay.classList.remove('active');
+  }
+
+  _renderAssignTeamsList(teams, assignedSet, isAll) {
+    const container = $('#assignTeamsList');
+    if (!container) return;
+
+    if (teams.length === 0) {
+      container.innerHTML = `
+        <div class="empty-state" style="padding: var(--space-lg);">
+          <div class="empty-state-text">No teams available. Load event data first.</div>
+        </div>
+      `;
+      return;
+    }
+
+    container.innerHTML = teams.map(t => {
+      const checked = isAll || assignedSet.has(t.number) ? 'checked' : '';
+      const disabled = isAll ? 'disabled' : '';
+      return `
+        <label class="at-team-item" data-team="${t.number}">
+          <input type="checkbox" value="${t.number}" ${checked} ${disabled}>
+          <span class="at-team-num">${t.number}</span>
+          <span class="at-team-name">${t.name}</span>
+        </label>
+      `;
+    }).join('');
+  }
+
+  toggleAllTeams(e) {
+    const isAll = e.target.checked;
+    const checkboxes = document.querySelectorAll('#assignTeamsList input[type="checkbox"]');
+    checkboxes.forEach(cb => {
+      cb.checked = isAll;
+      cb.disabled = isAll;
+    });
+  }
+
+  filterAssignTeams(e) {
+    const query = (e.target.value || '').toLowerCase().trim();
+    const items = document.querySelectorAll('#assignTeamsList .at-team-item');
+    items.forEach(item => {
+      const num = item.dataset.team || '';
+      const name = (item.querySelector('.at-team-name')?.textContent || '').toLowerCase();
+      const match = !query || num.includes(query) || name.includes(query);
+      item.style.display = match ? '' : 'none';
+    });
+  }
+
+  async saveAssignedTeams() {
+    if (!this._selectedMemberId) return;
+    const btn = $('#assignTeamsSaveBtn');
+    const allToggle = $('#assignTeamsAllToggle');
+    const isAll = allToggle?.checked;
+
+    let teams = [];
+    if (!isAll) {
+      const checkboxes = document.querySelectorAll('#assignTeamsList input[type="checkbox"]:checked');
+      teams = Array.from(checkboxes).map(cb => cb.value);
+    }
+
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = 'Saving...';
+    }
+
+    try {
+      await api.updateSubAccount(this._selectedMemberId, { assigned_teams: isAll ? [] : teams });
+      toast.success('Assigned teams updated');
+
+      // Update display on detail sheet
+      const teamsEl = $('#memberDetailTeams');
+      if (teamsEl) {
+        teamsEl.textContent = teams.length > 0 && !isAll
+          ? teams.join(', ')
+          : 'All teams';
+      }
+
+      // Update the member in local data
+      const member = (this.subAccounts || []).find(m => m.id === this._selectedMemberId);
+      if (member) {
+        member.assigned_teams = isAll ? [] : teams;
+      }
+
+      this.closeAssignTeamsSheet();
+      await this.loadTeamMembers();
+    } catch (error) {
+      console.error('Failed to update teams:', error);
+      toast.error('Failed to update assigned teams');
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = 'Save';
+      }
+    }
+  }
+
   async _selectMobileEvent(code, name) {
     this.currentEvent = code;
     this.eventName = name || code;

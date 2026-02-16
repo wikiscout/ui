@@ -1,6 +1,6 @@
 // WikiScout API Client
 
-const API_BASE = 'https://api.wikiscout.org'; // Production API - update with your API URL
+const API_BASE = 'https://prod.wikiscout.org'; // Production API - update with your API URL
 
 class WikiScoutAPI {
   constructor(baseUrl = API_BASE) {
@@ -297,6 +297,44 @@ class WikiScoutAPI {
 
   async whoami() {
     return this.request('/accounts/whoami');
+  }
+
+  // Custom Questions endpoints
+  async listCustomQuestions() {
+    return this.request('/custom-questions/list');
+  }
+
+  async saveCustomQuestion(questionData) {
+    return this.request('/custom-questions/save/', {
+      method: 'POST',
+      body: JSON.stringify(questionData),
+    });
+  }
+
+  async deleteCustomQuestion(id) {
+    return this.request(`/custom-questions/delete/?id=${id}`, { method: 'DELETE' });
+  }
+
+  async reorderCustomQuestions(order) {
+    return this.request('/custom-questions/reorder/', {
+      method: 'POST',
+      body: JSON.stringify({ order }),
+    });
+  }
+
+  async saveCustomResponses(scoutedTeam, eventCode, responses) {
+    return this.request('/custom-questions/responses/save/', {
+      method: 'POST',
+      body: JSON.stringify({ scouted_team: scoutedTeam, event_code: eventCode, responses }),
+    });
+  }
+
+  async getCustomResponses(scoutedTeam, eventCode) {
+    return this.request(`/custom-questions/responses/get/?team=${scoutedTeam}&event=${eventCode}`);
+  }
+
+  async getScoutedTeams(eventCode) {
+    return this.request(`/dashboard/scouted_teams/?event=${eventCode}`);
   }
 }
 
