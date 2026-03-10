@@ -4,6 +4,7 @@ class DashboardApp {
   constructor() {
     this.currentEvent = null;
     this.teamNumber = null;
+    this.program = 'FTC';
     this.userName = null;
     this.teams = [];
     this.teamNameMap = {};     // { teamNumber: nameShort } lookup
@@ -31,29 +32,26 @@ class DashboardApp {
   }
   
   async init() {
-    // Initialize icons
     initIcons();
-    
-    // Show loading state
     this.showLoading(true);
     
-    // Check authentication
+    // Fire auth check and data prefetch in parallel
+    const mePromise = api.getMe().catch(err => {
+      console.error('Failed to fetch /me:', err);
+      return { found: false };
+    });
+    
     const isAuthenticated = await this.checkAuth();
     if (!isAuthenticated) return;
     
-    // Setup event listeners
     this.setupNavigation();
     this.setupEventListeners();
     
-    // Load initial data
-    await this.loadInitialData();
+    // Pass the already-started mePromise so loadInitialData doesn't re-fetch
+    await this.loadInitialData(mePromise);
     
-    // Navigate to overview
     this.navigateTo('overview');
-    
     this.showLoading(false);
-    
-    // Start auto-refresh
     this._startAutoRefresh();
   }
   
@@ -70,6 +68,7 @@ class DashboardApp {
       const result = await api.validateToken();
       if (result && result.team_number) {
         this.teamNumber = result.team_number.toString();
+        this.program = result.program || 'FTC';
         this.userName = result.name || 'Team Member';
         this.updateUserInfo();
         return true;
@@ -138,10 +137,10 @@ class DashboardApp {
     
     if (userAvatar) userAvatar.textContent = initial;
     if (userName) userName.textContent = displayName;
-    if (userTeam) userTeam.textContent = `Team ${this.teamNumber}`;
+    if (userTeam) userTeam.textContent = `${this.program} Team ${this.teamNumber}`;
     if (settingsAvatar) settingsAvatar.textContent = initial;
     if (settingsName) settingsName.textContent = displayName;
-    if (settingsTeamInfo) settingsTeamInfo.textContent = `Team #${this.teamNumber}`;
+    if (settingsTeamInfo) settingsTeamInfo.textContent = `${this.program} Team #${this.teamNumber}`;
     if (settingsTeamNumber) settingsTeamNumber.value = this.teamNumber || '';
   }
   
@@ -305,6 +304,20 @@ class DashboardApp {
     // Logout
     $('#logoutBtn')?.addEventListener('click', () => this.logout());
     $('#settingsLogoutBtn')?.addEventListener('click', () => this.logout());
+
+    // API Key settings
+    const apiKeyInput = $('#settingsApiKey');
+    if (apiKeyInput) {
+      apiKeyInput.value = localStorage.getItem('wikiscout_api_key') || '';
+      $('#settingsApiKeySave')?.addEventListener('click', () => {
+        const val = apiKeyInput.value.trim();
+        if (val) localStorage.setItem('wikiscout_api_key', val);
+      });
+      $('#settingsApiKeyClear')?.addEventListener('click', () => {
+        localStorage.removeItem('wikiscout_api_key');
+        apiKeyInput.value = '';
+      });
+    }
     
     // Profile / Trading Card
     $('#profileForm')?.addEventListener('submit', (e) => this.handleProfileSave(e));
@@ -314,20 +327,31 @@ class DashboardApp {
     
     // Custom Questions
     this.setupCustomQuestionsListeners();
+    
+    // Tickets
+    this.setupTicketListeners();
+    
+    // Report modal
+    this.setupReportListeners();
   }
   
-  async loadInitialData() {
+  async loadInitialData(mePromise) {
     try {
-      // Get user info and current event
-      const meData = await api.getMe().catch(err => {
-        console.error('Failed to fetch /me:', err);
-        return { found: false };
-      });
+      const meData = mePromise
+        ? await mePromise
+        : await api.getMe().catch(err => {
+            console.error('Failed to fetch /me:', err);
+            return { found: false };
+          });
       
       // Apply server-side config (auto-refresh interval, etc.)
       if (meData.config) {
         const interval = meData.config.desktop_refresh_interval;
         this.autoRefreshInterval = (typeof interval === 'number' && interval >= 0) ? interval : 5000;
+      }
+      
+      if (meData.program) {
+        this.program = meData.program;
       }
 
       if (meData.found && meData.event) {
@@ -357,13 +381,18 @@ class DashboardApp {
         // Load event data
         await this.loadEventData();
       } else {
-        // No event found - check for stored event or show event picker
         this._allTeamEvents = meData.allEvents || [];
-        this.currentEvent = storage.get('currentEvent');
-        if (this.currentEvent) {
+        // Only restore stored event if it exists in the user's known events
+        const storedEvent = storage.get('currentEvent');
+        const knownCodes = (meData.allEvents || []).map(e => e.code);
+        if (storedEvent && knownCodes.includes(storedEvent)) {
+          this.currentEvent = storedEvent;
+          const found = (meData.allEvents || []).find(e => e.code === storedEvent);
+          if (found) this.eventName = found.name || storedEvent;
           await this.loadEventData();
         } else {
-          // Try to load today's events so user can pick one
+          this.currentEvent = null;
+          storage.remove('currentEvent');
           await this.loadTodayEvents();
         }
       }
@@ -423,7 +452,6 @@ class DashboardApp {
   }
   
   showNoEventState() {
-    // Show empty states when no event is loaded
     const containers = ['#topRankings', '#upcomingMatches', '#teamsGrid', '#rankingsTable'];
     containers.forEach(selector => {
       const container = $(selector);
@@ -431,12 +459,16 @@ class DashboardApp {
         container.innerHTML = `
           <div class="empty-state">
             <div class="empty-state-icon" data-icon="calendar" data-icon-size="48"></div>
-            <div class="empty-state-title">No Event Loaded</div>
-            <div class="empty-state-text">Join an event to see data</div>
+            <div class="empty-state-title">No Event Selected</div>
+            <div class="empty-state-text">Use the event picker to select an event</div>
           </div>
         `;
       }
     });
+    
+    const eventNameEl = $('#currentEventName');
+    if (eventNameEl) eventNameEl.textContent = 'No Event Selected';
+    
     initIcons();
   }
   
@@ -1174,6 +1206,7 @@ class DashboardApp {
         break;
       case 'settings':
         this.renderCustomQuestionsManager();
+        this.loadTickets();
         break;
       case 'profile':
         this.initCardPreviewListeners();
@@ -1926,7 +1959,7 @@ class DashboardApp {
       }
     }
     
-    const sections = [
+    const ftcSections = [
       {
         title: 'Tele-OP Performance',
         icon: 'robot',
@@ -1948,8 +1981,41 @@ class DashboardApp {
           { type: 'text', label: 'Auto Details', id: 'autoDetails', big: true }
         ]
       },
-      // Notes are in a separate panel now
     ];
+    const frcSections = [
+      {
+        title: 'Robot',
+        icon: 'robot',
+        fields: [
+          { type: 'options', label: 'Drivetrain', id: 'drivetrain', options: ['Swerve', 'Tank', 'Other'] },
+          { type: 'number', label: 'Intake Speed (balls/sec)', id: 'intakeSpeed' },
+          { type: 'options', label: 'Shooter Type', id: 'shooterType', options: ['Turret', 'Fixed'] },
+          { type: 'options', label: 'Number of Shooters', id: 'numShooters', options: ['1', '2', '3'] },
+          { type: 'options', label: 'Camera Usage', id: 'cameraUsage', options: ['Auto', 'Teleop', 'Both', 'None'] },
+          { type: 'number', label: 'Max Fuel Capacity', id: 'maxFuel' },
+          { type: 'number', label: 'Shooting Speed (balls/sec)', id: 'shootSpeed' }
+        ]
+      },
+      {
+        title: 'Autonomous',
+        icon: 'clock',
+        fields: [
+          { type: 'number', label: 'Auto Fuel Scored (avg)', id: 'autoFuel' },
+          { type: 'options', label: 'Auto Climb', id: 'autoClimb', options: ['Yes', 'No'] },
+          { type: 'text', label: 'Best Auto Description', id: 'autoDesc', big: true }
+        ]
+      },
+      {
+        title: 'Tele-Op',
+        icon: 'gamepad',
+        fields: [
+          { type: 'number', label: 'Tele-Op Fuel Scored (avg)', id: 'teleFuel' },
+          { type: 'options', label: 'Preferred Roles', id: 'roles', options: ['Shooter', 'Passer', 'Defence'] },
+          { type: 'options', label: 'Endgame Climb Level', id: 'climbLevel', options: ['0', '1', '2', '3'] }
+        ]
+      },
+    ];
+    const sections = this.program === 'FRC' ? frcSections : ftcSections;
     
     container.innerHTML = sections.map(section => `
       <div class="scout-section">
@@ -1989,9 +2055,11 @@ class DashboardApp {
       }
       
       // Map field IDs to data array indexes (same order as handleScoutSubmit)
-      const fieldIds = ['mecanum', 'driverPractice', 'teleOpBalls', 'shootingDist',
-                        'autoBalls', 'autoShooting', 'autoPoints', 'autoLeave',
-                        'autoDetails', 'privateNotes'];
+      const fieldIds = this.program === 'FRC'
+        ? ['drivetrain', 'intakeSpeed', 'shooterType', 'numShooters', 'cameraUsage', 'maxFuel', 'shootSpeed',
+           'autoFuel', 'autoClimb', 'autoDesc', 'teleFuel', 'roles', 'climbLevel', 'privateNotes']
+        : ['mecanum', 'driverPractice', 'teleOpBalls', 'shootingDist',
+           'autoBalls', 'autoShooting', 'autoPoints', 'autoLeave', 'autoDetails', 'privateNotes'];
       
       fieldIds.forEach((id, idx) => {
         const el = $(`#${id}`);
@@ -2152,9 +2220,11 @@ class DashboardApp {
     }
     
     const formData = [];
-    const fields = ['mecanum', 'driverPractice', 'teleOpBalls', 'shootingDist', 
-                   'autoBalls', 'autoShooting', 'autoPoints', 'autoLeave', 
-                   'autoDetails', 'privateNotes'];
+    const fields = this.program === 'FRC'
+      ? ['drivetrain', 'intakeSpeed', 'shooterType', 'numShooters', 'cameraUsage', 'maxFuel', 'shootSpeed',
+         'autoFuel', 'autoClimb', 'autoDesc', 'teleFuel', 'roles', 'climbLevel', 'privateNotes']
+      : ['mecanum', 'driverPractice', 'teleOpBalls', 'shootingDist', 
+         'autoBalls', 'autoShooting', 'autoPoints', 'autoLeave', 'autoDetails', 'privateNotes'];
     
     fields.forEach(field => {
       const el = $(`#${field}`);
@@ -2525,6 +2595,7 @@ class DashboardApp {
               <div class="data-entry-header">
                 <div class="data-entry-title">${title}</div>
                 <span class="badge badge-secondary">Public</span>
+                ${entry.id ? `<button class="report-flag-btn" onclick="event.stopPropagation();app.openReportModal('scouting_data',${entry.id},'Scouting data by Team ${entry.scouting_team}')" title="Report"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></svg></button>` : ''}
               </div>
               <div class="data-entry-body compact">
                 <div class="data-rows-grid">${shortFieldsHTML}</div>
@@ -2670,6 +2741,7 @@ class DashboardApp {
               <div class="dmn-note-entry">
                 ${n.scouting_team && !n.isYours ? `<span class="dmn-note-source">Team ${n.scouting_team}</span>` : ''}
                 <span class="dmn-note-text">${n.notes}</span>
+                ${!n.isYours && n.id ? `<button class="report-flag-btn" onclick="event.stopPropagation();app.openReportModal('match_note',${n.id},'Match note by Team ${n.scouting_team || "??"}')" title="Report"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></svg></button>` : ''}
               </div>
             `).join('')}
           </div>
@@ -2813,6 +2885,16 @@ class DashboardApp {
     if (emptyView) emptyView.style.display = 'none';
     if (detailView) detailView.style.display = 'block';
     
+    // Immediately clear QR code to prevent showing previous member's code
+    const qrContainer = $('#memberQrCode');
+    if (qrContainer) {
+      qrContainer.innerHTML = `
+        <div class="empty-state" style="padding: var(--space-lg);">
+          <span class="spinner" style="width:24px;height:24px;border-width:2px;"></span>
+        </div>
+      `;
+    }
+    
     // Populate detail
     const nameEl = $('#memberDetailName');
     const createdEl = $('#memberDetailCreated');
@@ -2850,7 +2932,7 @@ class DashboardApp {
       initIcons();
     }
     
-    // Load existing credentials
+    // Load existing credentials (will update QR when ready)
     await this.loadMemberCredentials(memberId);
     
     initIcons();
@@ -2959,8 +3041,10 @@ class DashboardApp {
     try {
       const data = await api.getSubAccountCredentials(memberId);
       
+      // Guard: if user switched to a different member while loading, discard this result
+      if (this.selectedMemberId !== memberId) return;
+      
       if (data.token) {
-        // Build login URL for QR code
         const loginUrl = `${window.location.origin}/code.html?token=${data.token}`;
         if (qrContainer) {
           this.generateQRCode(qrContainer, loginUrl, 180);
@@ -2989,7 +3073,7 @@ class DashboardApp {
       }
     } catch (error) {
       console.error('Failed to load credentials:', error);
-      // Show empty state
+      if (this.selectedMemberId !== memberId) return;
       if (qrContainer) {
         qrContainer.innerHTML = `
           <div class="empty-state" style="padding: var(--space-lg);">
@@ -3591,7 +3675,7 @@ class DashboardApp {
       }
     } catch (error) {
       console.error('Failed to save profile:', error);
-      toast.error('Failed to save profile: ' + (error.message || 'Unknown error'));
+      toast.error('Failed to save profile: ' + (error.message || 'Unknown error'), error.errorInfo);
     } finally {
       if (submitBtn) {
         submitBtn.disabled = false;
@@ -3630,7 +3714,7 @@ class DashboardApp {
       
     } catch (error) {
       console.error('Failed to create photo session:', error);
-      toast.error('Failed to start upload session');
+      toast.error('Failed to start upload session', error.errorInfo);
       this.cancelPhotoUpload();
     }
   }
@@ -4802,7 +4886,7 @@ class DashboardApp {
       await this.renderCustomQuestionsManager();
     } catch (e) {
       console.error('Failed to delete custom question:', e);
-      toast.error('Failed to delete');
+      toast.error('Failed to delete', e.errorInfo);
     }
   }
   
@@ -4862,7 +4946,7 @@ class DashboardApp {
       this.renderScoutCustomFields();
     } catch (e) {
       console.error('Failed to save custom question:', e);
-      toast.error('Failed to save');
+      toast.error('Failed to save', e.errorInfo);
     }
   }
   
@@ -4974,6 +5058,208 @@ class DashboardApp {
   }
   
   // ===================== End Custom Questions =====================
+
+  // ===================== Tickets =====================
+
+  setupTicketListeners() {
+    $('#newTicketBtn')?.addEventListener('click', () => {
+      const form = $('#newTicketForm');
+      if (form) form.style.display = form.style.display === 'none' ? 'block' : 'none';
+    });
+    $('#ticketCancelBtn')?.addEventListener('click', () => {
+      const form = $('#newTicketForm');
+      if (form) form.style.display = 'none';
+    });
+    $('#ticketSubmitBtn')?.addEventListener('click', () => this.createTicket());
+    $('#ticketBackBtn')?.addEventListener('click', () => this.closeTicketDetail());
+    $('#ticketReplyBtn')?.addEventListener('click', () => this.replyToTicket());
+  }
+
+  async loadTickets() {
+    try {
+      const data = await api.getTickets();
+      this.renderTicketList(data.tickets || []);
+    } catch (e) {
+      console.error('Failed to load tickets:', e);
+    }
+  }
+
+  renderTicketList(tickets) {
+    const container = $('#ticketList');
+    if (!container) return;
+    if (!tickets.length) {
+      container.innerHTML = '<div class="empty-state" style="padding:var(--space-xl);text-align:center;"><p style="color:var(--text-secondary);">No tickets yet. Click "New Ticket" to get started.</p></div>';
+      return;
+    }
+    container.innerHTML = tickets.map(t => `
+      <div class="ticket-item" data-ticket-id="${t.id}">
+        <div class="ticket-item-info">
+          <div class="ticket-item-subject">${this.escapeHtml(t.subject)}</div>
+          <div class="ticket-item-meta">${t.category} &middot; ${new Date(t.created_at + 'Z').toLocaleDateString()} &middot; ${t.message_count} message${t.message_count !== 1 ? 's' : ''}</div>
+        </div>
+        <span class="ticket-status-badge" data-status="${t.status}">${t.status.replace('_', ' ')}</span>
+      </div>
+    `).join('');
+    container.querySelectorAll('.ticket-item').forEach(el => {
+      el.addEventListener('click', () => this.openTicket(parseInt(el.dataset.ticketId)));
+    });
+  }
+
+  async createTicket() {
+    const subject = $('#ticketSubject')?.value?.trim();
+    const category = $('#ticketCategory')?.value || 'support';
+    const message = $('#ticketMessage')?.value?.trim();
+    if (!subject || !message) return;
+    const btn = $('#ticketSubmitBtn');
+    if (btn) { btn.disabled = true; btn.textContent = 'Submitting...'; }
+    try {
+      await api.createTicket(subject, category, message);
+      if ($('#newTicketForm')) $('#newTicketForm').style.display = 'none';
+      if ($('#ticketSubject')) $('#ticketSubject').value = '';
+      if ($('#ticketMessage')) $('#ticketMessage').value = '';
+      await this.loadTickets();
+    } catch (e) {
+      console.error('Failed to create ticket:', e);
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = 'Submit Ticket'; }
+    }
+  }
+
+  async openTicket(id) {
+    const container = $('#ticketList');
+    const detail = $('#ticketDetail');
+    if (container) container.style.display = 'none';
+    if ($('#newTicketForm')) $('#newTicketForm').style.display = 'none';
+    if ($('#newTicketBtn')) $('#newTicketBtn').style.display = 'none';
+    if (detail) detail.style.display = 'block';
+
+    try {
+      const data = await api.getTicket(id);
+      const t = data.ticket;
+      this._openTicketId = t.id;
+      $('#ticketDetailSubject').textContent = t.subject;
+      const statusEl = $('#ticketDetailStatus');
+      if (statusEl) { statusEl.textContent = t.status.replace('_', ' '); statusEl.dataset.status = t.status; }
+      $('#ticketDetailCategory').textContent = t.category;
+      $('#ticketDetailDate').textContent = new Date(t.created_at + 'Z').toLocaleString();
+
+      const closed = t.status === 'closed';
+      const replyBox = $('#ticketReplyBox');
+      if (replyBox) replyBox.style.display = closed ? 'none' : 'block';
+
+      const messagesEl = $('#ticketMessages');
+      if (messagesEl) {
+        messagesEl.innerHTML = (data.messages || []).map(m => {
+          const cls = m.sender_type === 'user' ? 'msg-user' : m.sender_type === 'developer' ? 'msg-developer' : 'msg-system';
+          const label = m.sender_type === 'user' ? 'You' : m.sender_type === 'developer' ? 'Support' : 'System';
+          return `<div class="ticket-msg ${cls}">
+            <div class="ticket-msg-header"><span>${label}</span><span>${new Date(m.created_at + 'Z').toLocaleString()}</span></div>
+            <div>${this.escapeHtml(m.message).replace(/\n/g, '<br>')}</div>
+          </div>`;
+        }).join('');
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+      }
+    } catch (e) {
+      console.error('Failed to load ticket:', e);
+    }
+    initIcons();
+  }
+
+  closeTicketDetail() {
+    const container = $('#ticketList');
+    const detail = $('#ticketDetail');
+    if (container) container.style.display = '';
+    if (detail) detail.style.display = 'none';
+    if ($('#newTicketBtn')) $('#newTicketBtn').style.display = '';
+  }
+
+  async replyToTicket() {
+    const input = $('#ticketReplyInput');
+    const message = input?.value?.trim();
+    if (!message || !this._openTicketId) return;
+    const btn = $('#ticketReplyBtn');
+    if (btn) { btn.disabled = true; btn.textContent = 'Sending...'; }
+    try {
+      await api.replyToTicket(this._openTicketId, message);
+      input.value = '';
+      await this.openTicket(this._openTicketId);
+    } catch (e) {
+      console.error('Failed to reply:', e);
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = 'Send Reply'; }
+    }
+  }
+
+  escapeHtml(str) {
+    if (!str) return '';
+    return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  // ===================== Report System =====================
+
+  setupReportListeners() {
+    this._reportData = null;
+    $('#reportCloseBtn')?.addEventListener('click', () => this.closeReportModal());
+    $('#reportBackBtn')?.addEventListener('click', () => this.reportStepBack());
+    $('#reportSubmitBtn')?.addEventListener('click', () => this.submitReport());
+    document.querySelectorAll('.report-reason-btn').forEach(btn => {
+      btn.addEventListener('click', () => this.selectReportReason(btn.dataset.reason));
+    });
+    $('#reportOverlay')?.addEventListener('click', (e) => {
+      if (e.target === e.currentTarget) this.closeReportModal();
+    });
+  }
+
+  openReportModal(contentType, contentId, previewText) {
+    this._reportData = { contentType, contentId, reason: null };
+    $('#reportPreviewContent').textContent = previewText || `${contentType} #${contentId}`;
+    $('#reportStep1').classList.remove('hidden');
+    $('#reportStep2').classList.remove('active');
+    $('#reportBackBtn').style.display = 'none';
+    $('#reportSubmitBtn').style.display = 'none';
+    $('#reportDescription').value = '';
+    $('#reportOverlay').classList.add('active');
+  }
+
+  closeReportModal() {
+    $('#reportOverlay')?.classList.remove('active');
+    this._reportData = null;
+  }
+
+  selectReportReason(reason) {
+    if (!this._reportData) return;
+    this._reportData.reason = reason;
+    const labels = { inaccurate: 'Inaccurate Data', spam: 'Spam', inappropriate: 'Inappropriate Content', harassment: 'Harassment', other: 'Something Else' };
+    $('#reportReasonLabel').textContent = labels[reason] || reason;
+    $('#reportStep1').classList.add('hidden');
+    $('#reportStep2').classList.add('active');
+    $('#reportBackBtn').style.display = '';
+    $('#reportSubmitBtn').style.display = '';
+  }
+
+  reportStepBack() {
+    $('#reportStep1').classList.remove('hidden');
+    $('#reportStep2').classList.remove('active');
+    $('#reportBackBtn').style.display = 'none';
+    $('#reportSubmitBtn').style.display = 'none';
+  }
+
+  async submitReport() {
+    if (!this._reportData?.reason) return;
+    const btn = $('#reportSubmitBtn');
+    if (btn) { btn.disabled = true; btn.textContent = 'Submitting...'; }
+    try {
+      const desc = $('#reportDescription')?.value?.trim() || '';
+      await api.reportContent(this._reportData.contentType, this._reportData.contentId, this._reportData.reason, desc);
+      this.closeReportModal();
+    } catch (e) {
+      console.error('Failed to submit report:', e);
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = 'Submit Report'; }
+    }
+  }
+
+  // ===================== End Tickets & Reports =====================
   
   async logout() {
     try {

@@ -4,6 +4,7 @@ class MobileApp {
   constructor() {
     this.currentEvent = null;
     this.teamNumber = null;
+    this.program = 'FTC';
     this.teams = [];
     this.teamNameMap = {};     // { teamNumber: nameShort } lookup
     this.rankings = [];
@@ -27,29 +28,28 @@ class MobileApp {
   }
   
   async init() {
-    // Initialize icons
     initIcons();
     
-    // Check authentication
+    // Fire data prefetch in parallel with auth check
+    const mePromise = api.getMe().catch(err => {
+      console.error('Failed to fetch /me:', err);
+      return { found: false };
+    });
+    const todayPromise = api.getTodayEvents().catch(() => ({ events: [] }));
+    
     await this.checkAuth();
     
-    // Setup navigation and events
     this.setupNavigation();
     this.setupEventListeners();
     
-    // Load initial data
-    await this.loadInitialData();
+    await this.loadInitialData(mePromise, todayPromise);
     
-    // Start offline queue processor
     this._startOfflineQueueProcessor();
-    
-    // Start auto-refresh
     this._startAutoRefresh();
     
-    // Hide loading screen
     setTimeout(() => {
       $('#loadingScreen').style.display = 'none';
-    }, 500);
+    }, 300);
   }
   
   async checkAuth() {
@@ -57,10 +57,11 @@ class MobileApp {
       const result = await api.validateToken();
       if (result && result.team_number) {
         this.teamNumber = result.team_number.toString();
+        this.program = result.program || 'FTC';
         this.userName = result.name || 'Team Member';
         this.isSubAccount = !!result.is_sub_account;
         this.assignedTeams = (result.assigned_teams || []).map(String);
-        $('#mobileSubtitle').textContent = `Team #${this.teamNumber}`;
+        $('#mobileSubtitle').textContent = `${this.program} Team #${this.teamNumber}`;
         
         // Show Team tab for parent accounts (not sub-accounts)
         if (!this.isSubAccount) {
@@ -76,8 +77,9 @@ class MobileApp {
     
     // Demo mode fallback
     this.teamNumber = '16072';
+    this.program = 'FTC';
     this.userName = 'Demo User';
-    $('#mobileSubtitle').textContent = `Team #${this.teamNumber} (Demo)`;
+    $('#mobileSubtitle').textContent = `${this.program} Team #${this.teamNumber} (Demo)`;
     
     // Only redirect on explicit unauthorized event
     window.addEventListener('auth:unauthorized', (e) => {
@@ -243,71 +245,92 @@ class MobileApp {
     $('#assignTeamsSaveBtn')?.addEventListener('click', () => this.saveAssignedTeams());
     $('#assignTeamsAllToggle')?.addEventListener('change', (e) => this.toggleAllTeams(e));
     $('#assignTeamsSearch')?.addEventListener('input', (e) => this.filterAssignTeams(e));
+
+    // Report modal
+    this._reportData = null;
+    $('#reportCloseBtn')?.addEventListener('click', () => this.closeReportModal());
+    $('#reportBackBtn')?.addEventListener('click', () => this.reportStepBack());
+    $('#reportSubmitBtn')?.addEventListener('click', () => this.submitReport());
+    document.querySelectorAll('.report-reason-btn').forEach(btn => {
+      btn.addEventListener('click', () => this.selectReportReason(btn.dataset.reason));
+    });
+    $('#reportOverlay')?.addEventListener('click', (e) => {
+      if (e.target === e.currentTarget) this.closeReportModal();
+    });
   }
   
-  async loadInitialData() {
+  async loadInitialData(mePromise, todayPromise) {
     try {
-      // Get current event
-      const meData = await api.getMe().catch(err => {
-        console.error('Failed to fetch /me:', err);
-        return { found: false };
-      });
+      const [meData, todayData] = await Promise.all([
+        mePromise || api.getMe().catch(err => {
+          console.error('Failed to fetch /me:', err);
+          return { found: false };
+        }),
+        todayPromise || api.getTodayEvents().catch(() => ({ events: [] })),
+      ]);
       
       // Apply server-side config (auto-refresh interval, etc.)
       if (meData.config) {
         const interval = meData.config.mobile_refresh_interval;
         this.autoRefreshInterval = (typeof interval === 'number' && interval >= 0) ? interval : 15000;
       }
+      
+      if (meData.program) {
+        this.program = meData.program;
+      }
 
       if (meData.found && meData.event) {
-        // Store all events for division grouping
         this._allTeamEvents = meData.allEvents || [];
 
-        // Auto-select division event: if the team has multiple active events
-        // where one code is a prefix of another, prefer the longer (division) code
         const activeEvents = (meData.allEvents || []).filter(e => e.status === 'live');
         if (activeEvents.length > 1) {
-          // Find events sharing a common prefix (division grouping)
           const picked = this._pickDivisionEvent(activeEvents);
           this.currentEvent = picked.code;
           this.eventName = picked.name || picked.code;
         } else {
-        this.currentEvent = meData.event.code;
-        this.eventName = meData.event.name || this.currentEvent;
+          this.currentEvent = meData.event.code;
+          this.eventName = meData.event.name || this.currentEvent;
         }
         storage.set('currentEvent', this.currentEvent);
       } else {
-        this.currentEvent = storage.get('currentEvent');
         this._allTeamEvents = meData.allEvents || [];
+        // Only restore stored event if it exists in the user's known events
+        const storedEvent = storage.get('currentEvent');
+        const knownCodes = (meData.allEvents || []).map(e => e.code);
+        if (storedEvent && knownCodes.includes(storedEvent)) {
+          this.currentEvent = storedEvent;
+          const found = (meData.allEvents || []).find(e => e.code === storedEvent);
+          if (found) this.eventName = found.name || storedEvent;
+        } else {
+          this.currentEvent = null;
+          this.eventName = null;
+          storage.remove('currentEvent');
+        }
       }
       
-      // Load today's events
-      const todayData = await api.getTodayEvents().catch(() => ({ events: [] }));
-      
-      // If no events today, leave the list empty — user can pick via event picker
       if (!todayData.events) {
         todayData.events = [];
       }
       
-      // Events are selected via event picker modal, no need to populate a select
-      
-      // If no current event but there are events today, pick the first one
       if (!this.currentEvent && todayData.events && todayData.events.length > 0) {
         this.currentEvent = todayData.events[0].code;
         this.eventName = todayData.events[0].name;
         storage.set('currentEvent', this.currentEvent);
       }
       
-      // Update event banners
       this.updateEventBanners();
       
-      // Load event data
       if (this.currentEvent) {
-        await this.loadEventData();
+        // Load event data and OTP in parallel
+        await Promise.all([
+          this.loadEventData(),
+          this.loadOtp(),
+        ]);
+      } else {
+        // No event — show empty state and load OTP
+        this.showNoEventState();
+        await this.loadOtp();
       }
-      
-      // Load OTP
-      this.loadOtp();
       
     } catch (error) {
       console.error('Failed to load initial data:', error);
@@ -352,6 +375,28 @@ class MobileApp {
       const el = $(sel);
       if (el) el.textContent = code;
     });
+  }
+  
+  showNoEventState() {
+    this.teams = [];
+    this.rankings = [];
+    this.matches = [];
+    
+    const emptyHtml = `
+      <div class="empty-state">
+        <div class="empty-state-icon" data-icon="calendar" data-icon-size="48"></div>
+        <div class="empty-state-title">No Event Selected</div>
+        <div class="empty-state-text">Tap the event banner above to select an event</div>
+      </div>
+    `;
+    
+    const rankingsContainer = $('#mobileRankingsList');
+    if (rankingsContainer) rankingsContainer.innerHTML = emptyHtml;
+    
+    const matchesContainer = $('#mobileMatchList');
+    if (matchesContainer) matchesContainer.innerHTML = emptyHtml;
+    
+    initIcons();
   }
   
   _isDevDataEvent() {
@@ -483,7 +528,7 @@ class MobileApp {
       await this.loadEventData();
       toast.success('Data refreshed');
     } catch (e) {
-      toast.error('Failed to refresh data');
+      toast.error('Failed to refresh data', e.errorInfo);
     } finally {
       if (btn) {
         btn.disabled = false;
@@ -857,11 +902,12 @@ class MobileApp {
     if (!container) return;
     
     if (this.rankings.length === 0) {
+      const noEvent = !this.currentEvent;
       container.innerHTML = `
         <div class="empty-state">
-          <div class="empty-state-icon" data-icon="rankings" data-icon-size="48"></div>
-          <div class="empty-state-title">No Rankings</div>
-          <div class="empty-state-text">Rankings will appear when data is available</div>
+          <div class="empty-state-icon" data-icon="${noEvent ? 'calendar' : 'rankings'}" data-icon-size="48"></div>
+          <div class="empty-state-title">${noEvent ? 'No Event Selected' : 'No Rankings Yet'}</div>
+          <div class="empty-state-text">${noEvent ? 'Tap the event banner above to select an event' : 'Rankings will appear once matches are played'}</div>
         </div>
       `;
       initIcons();
@@ -1043,11 +1089,12 @@ class MobileApp {
     if (!container) return;
     
     if (this.matches.length === 0) {
+      const noEvent = !this.currentEvent;
       container.innerHTML = `
         <div class="empty-state">
-          <div class="empty-state-icon" data-icon="matches" data-icon-size="48"></div>
-          <div class="empty-state-title">No Matches</div>
-          <div class="empty-state-text">Match schedule will appear when data is available</div>
+          <div class="empty-state-icon" data-icon="${noEvent ? 'calendar' : 'matches'}" data-icon-size="48"></div>
+          <div class="empty-state-title">${noEvent ? 'No Event Selected' : 'No Matches Yet'}</div>
+          <div class="empty-state-text">${noEvent ? 'Tap the event banner above to select an event' : 'Match schedule will appear when available'}</div>
         </div>
       `;
       initIcons();
@@ -1402,7 +1449,7 @@ class MobileApp {
       toast.success(`Notes saved for Team ${teamNumber}`);
     } catch (e) {
       console.error('Failed to save match notes:', e);
-      toast.error('Failed to save notes');
+      toast.error('Failed to save notes', e.errorInfo);
     }
   }
   
@@ -1552,6 +1599,7 @@ class MobileApp {
               <div class="mn-note-entry">
                 ${n.scouting_team && !n.isYours ? `<span class="mn-note-source">Team ${n.scouting_team}</span>` : ''}
                 ${n.notes}
+                ${!n.isYours && n.id ? `<button class="report-flag-btn" onclick="event.stopPropagation();mobileApp.openReportModal('match_note',${n.id},'Match note by Team ${n.scouting_team || "??"}')" title="Report"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></svg></button>` : ''}
               </div>
             `).join('')}
           </div>
@@ -1911,6 +1959,7 @@ class MobileApp {
             <div class="data-section other-data">
               <div class="data-section-header">
                 <span class="data-section-title">Scouted by Team ${entry.scouting_team}</span>
+                ${entry.id ? `<button class="report-flag-btn" onclick="event.stopPropagation();mobileApp.openReportModal('scouting_data',${entry.id},'Scouting data by Team ${entry.scouting_team}')" title="Report"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></svg></button>` : ''}
               </div>
               <div class="data-section-body">
                 ${data.fields.map((field, i) => `
@@ -1931,7 +1980,7 @@ class MobileApp {
       this.loadTeamMatchNotes(team, container);
       
     } catch (error) {
-      toast.error('Failed to load team data');
+      toast.error('Failed to load team data', error.errorInfo);
       console.error(error);
     }
   }
@@ -1950,7 +1999,7 @@ class MobileApp {
     const container = $('#mobileFormFields');
     if (!container) return;
     
-    const formConfig = [
+    const ftcFormConfig = [
       { type: 'header', label: 'Tele-OP' },
       { type: 'checkbox', label: 'Mecanum Drive Train', id: 'mecanum' },
       { type: 'slider', label: 'Driver Practice', id: 'driverPractice', min: 0, max: 3, step: 1 },
@@ -1964,6 +2013,26 @@ class MobileApp {
       { type: 'text', label: 'Auto Details', id: 'autoDetails', big: true, description: 'Describe their autonomous routines' },
       { type: 'text', label: 'Private Notes', id: 'privateNotes', big: true, description: 'Only your team can see this' }
     ];
+    const frcFormConfig = [
+      { type: 'header', label: 'Robot' },
+      { type: 'options', label: 'Drivetrain', id: 'drivetrain', options: ['Swerve', 'Tank', 'Other'] },
+      { type: 'number', label: 'Intake Speed (balls/sec)', id: 'intakeSpeed' },
+      { type: 'options', label: 'Shooter Type', id: 'shooterType', options: ['Turret', 'Fixed'] },
+      { type: 'options', label: 'Number of Shooters', id: 'numShooters', options: ['1', '2', '3'] },
+      { type: 'options', label: 'Camera Usage', id: 'cameraUsage', options: ['Auto', 'Teleop', 'Both', 'None'] },
+      { type: 'number', label: 'Max Fuel Capacity', id: 'maxFuel' },
+      { type: 'number', label: 'Shooting Speed (balls/sec)', id: 'shootSpeed' },
+      { type: 'header', label: 'Autonomous' },
+      { type: 'number', label: 'Auto Fuel Scored (avg)', id: 'autoFuel' },
+      { type: 'options', label: 'Auto Climb', id: 'autoClimb', options: ['Yes', 'No'] },
+      { type: 'text', label: 'Best Auto Description', id: 'autoDesc', big: true, description: 'Describe their best autonomous routine' },
+      { type: 'header', label: 'Tele-Op' },
+      { type: 'number', label: 'Tele-Op Fuel Scored (avg)', id: 'teleFuel' },
+      { type: 'options', label: 'Preferred Roles', id: 'roles', options: ['Shooter', 'Passer', 'Defence'] },
+      { type: 'options', label: 'Endgame Climb Level', id: 'climbLevel', options: ['0', '1', '2', '3'] },
+      { type: 'text', label: 'Private Notes', id: 'privateNotes', big: true, description: 'Only your team can see this' }
+    ];
+    const formConfig = this.program === 'FRC' ? frcFormConfig : ftcFormConfig;
     
     let currentSection = null;
     let sectionFields = [];
@@ -2076,9 +2145,11 @@ class MobileApp {
       // Fill standard fields
       if (data && data.private_data && data.private_data.data) {
         const formData = data.private_data.data;
-        const fields = ['mecanum', 'driverPractice', 'teleOpBalls', 'shootingDist',
-                        'autoBalls', 'autoShooting', 'autoPoints', 'autoLeave',
-                        'autoDetails', 'privateNotes'];
+        const fields = this.program === 'FRC'
+          ? ['drivetrain', 'intakeSpeed', 'shooterType', 'numShooters', 'cameraUsage', 'maxFuel', 'shootSpeed',
+             'autoFuel', 'autoClimb', 'autoDesc', 'teleFuel', 'roles', 'climbLevel', 'privateNotes']
+          : ['mecanum', 'driverPractice', 'teleOpBalls', 'shootingDist',
+             'autoBalls', 'autoShooting', 'autoPoints', 'autoLeave', 'autoDetails', 'privateNotes'];
         fields.forEach((fieldId, i) => {
           const el = $(`#m${fieldId}`);
           if (el && formData[i] !== undefined) {
@@ -2139,9 +2210,11 @@ class MobileApp {
     if (submitText) submitText.style.display = 'none';
     if (submitLoading) submitLoading.style.display = 'inline-flex';
     
-    const fields = ['mecanum', 'driverPractice', 'teleOpBalls', 'shootingDist',
-                   'autoBalls', 'autoShooting', 'autoPoints', 'autoLeave',
-                   'autoDetails', 'privateNotes'];
+    const fields = this.program === 'FRC'
+      ? ['drivetrain', 'intakeSpeed', 'shooterType', 'numShooters', 'cameraUsage', 'maxFuel', 'shootSpeed',
+         'autoFuel', 'autoClimb', 'autoDesc', 'teleFuel', 'roles', 'climbLevel', 'privateNotes']
+      : ['mecanum', 'driverPractice', 'teleOpBalls', 'shootingDist',
+         'autoBalls', 'autoShooting', 'autoPoints', 'autoLeave', 'autoDetails', 'privateNotes'];
     
     const formData = fields.map(field => {
       const el = $(`#m${field}`);
@@ -2390,7 +2463,7 @@ class MobileApp {
       this.displayOtp(data.code);
       toast.success('New code generated');
     } catch (error) {
-      toast.error('Failed to generate');
+      toast.error('Failed to generate', error.errorInfo);
     }
   }
   
@@ -2400,7 +2473,7 @@ class MobileApp {
       this.displayOtp('------');
       toast.success('Code deleted');
     } catch (error) {
-      toast.error('Failed to delete');
+      toast.error('Failed to delete', error.errorInfo);
     }
   }
   
@@ -2887,7 +2960,7 @@ class MobileApp {
       await this.loadTeamMembers();
     } catch (error) {
       console.error('Failed to add member:', error);
-      toast.error('Failed to add member');
+      toast.error('Failed to add member', error.errorInfo);
     } finally {
       if (btn) {
         btn.disabled = false;
@@ -2938,10 +3011,12 @@ class MobileApp {
         : 'All teams';
     }
     
-    // Reset QR state
+    // Reset QR state immediately to prevent showing stale QR
     this._memberLoginUrl = null;
     const qrBtn = $('#memberShowQrBtn');
     if (qrBtn) qrBtn.disabled = true;
+    // Close any enlarged QR from previous member
+    this.closeEnlargedQr();
     
     // Toggle button text
     const toggleBtn = $('#memberToggleBtn');
@@ -2987,7 +3062,7 @@ class MobileApp {
       this.openMemberDetail(this._selectedMemberId);
     } catch (error) {
       console.error('Failed to toggle member:', error);
-      toast.error('Failed to update member');
+      toast.error('Failed to update member', error.errorInfo);
     } finally {
       if (btn) btn.disabled = false;
     }
@@ -3010,7 +3085,7 @@ class MobileApp {
       await this.loadTeamMembers();
     } catch (error) {
       console.error('Failed to delete member:', error);
-      toast.error('Failed to remove member');
+      toast.error('Failed to remove member', error.errorInfo);
     } finally {
       if (btn) btn.disabled = false;
     }
@@ -3104,7 +3179,7 @@ class MobileApp {
       toast.success('Credentials generated');
     } catch (error) {
       console.error('Failed to generate credentials:', error);
-      toast.error('Failed to generate credentials');
+      toast.error('Failed to generate credentials', error.errorInfo);
     } finally {
       if (btn) {
         btn.disabled = false;
@@ -3266,7 +3341,7 @@ class MobileApp {
       await this.loadTeamMembers();
     } catch (error) {
       console.error('Failed to update teams:', error);
-      toast.error('Failed to update assigned teams');
+      toast.error('Failed to update assigned teams', error.errorInfo);
     } finally {
       if (btn) {
         btn.disabled = false;
@@ -3290,7 +3365,71 @@ class MobileApp {
       toast.success(`Switched to ${this.eventName}`);
     } catch (err) {
       console.error('Failed to load event data:', err);
-      toast.error('Failed to load event data');
+      toast.error('Failed to load event data', err.errorInfo);
+    }
+  }
+
+  // ===================== Report System =====================
+
+  openReportModal(contentType, contentId, previewText) {
+    this._reportData = { contentType, contentId, reason: null };
+    const previewEl = document.getElementById('reportPreviewContent');
+    if (previewEl) previewEl.textContent = previewText || `${contentType} #${contentId}`;
+    const step1 = document.getElementById('reportStep1');
+    const step2 = document.getElementById('reportStep2');
+    if (step1) step1.classList.remove('hidden');
+    if (step2) step2.classList.remove('active');
+    const backBtn = document.getElementById('reportBackBtn');
+    const submitBtn = document.getElementById('reportSubmitBtn');
+    if (backBtn) backBtn.style.display = 'none';
+    if (submitBtn) submitBtn.style.display = 'none';
+    const desc = document.getElementById('reportDescription');
+    if (desc) desc.value = '';
+    document.getElementById('reportOverlay')?.classList.add('active');
+  }
+
+  closeReportModal() {
+    document.getElementById('reportOverlay')?.classList.remove('active');
+    this._reportData = null;
+  }
+
+  selectReportReason(reason) {
+    if (!this._reportData) return;
+    this._reportData.reason = reason;
+    const labels = { inaccurate: 'Inaccurate Data', spam: 'Spam', inappropriate: 'Inappropriate Content', harassment: 'Harassment', other: 'Something Else' };
+    const labelEl = document.getElementById('reportReasonLabel');
+    if (labelEl) labelEl.textContent = labels[reason] || reason;
+    document.getElementById('reportStep1')?.classList.add('hidden');
+    document.getElementById('reportStep2')?.classList.add('active');
+    const backBtn = document.getElementById('reportBackBtn');
+    const submitBtn = document.getElementById('reportSubmitBtn');
+    if (backBtn) backBtn.style.display = '';
+    if (submitBtn) submitBtn.style.display = '';
+  }
+
+  reportStepBack() {
+    document.getElementById('reportStep1')?.classList.remove('hidden');
+    document.getElementById('reportStep2')?.classList.remove('active');
+    const backBtn = document.getElementById('reportBackBtn');
+    const submitBtn = document.getElementById('reportSubmitBtn');
+    if (backBtn) backBtn.style.display = 'none';
+    if (submitBtn) submitBtn.style.display = 'none';
+  }
+
+  async submitReport() {
+    if (!this._reportData?.reason) return;
+    const btn = document.getElementById('reportSubmitBtn');
+    if (btn) { btn.disabled = true; btn.textContent = 'Submitting...'; }
+    try {
+      const desc = document.getElementById('reportDescription')?.value?.trim() || '';
+      await api.reportContent(this._reportData.contentType, this._reportData.contentId, this._reportData.reason, desc);
+      this.closeReportModal();
+      toast.success('Report submitted');
+    } catch (e) {
+      console.error('Failed to submit report:', e);
+      toast.error('Failed to submit report', e.errorInfo);
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = 'Submit Report'; }
     }
   }
 }

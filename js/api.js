@@ -1,6 +1,7 @@
 // WikiScout API Client
 
 const API_BASE = 'https://prod.wikiscout.org'; // Production API - update with your API URL
+window._wsApiBase = API_BASE;
 
 class WikiScoutAPI {
   constructor(baseUrl = API_BASE) {
@@ -10,13 +11,18 @@ class WikiScoutAPI {
   async request(endpoint, options = {}) {
     const url = `${this.baseUrl}${endpoint}`;
     
+    const extraHeaders = {};
+    const apiKey = localStorage.getItem('wikiscout_api_key') || 'ws_a1b0cec440d9c6dec7fd6e5e66b5cc2fe9ac8b7aecd45f5109019e5eec14ac7c';
+    if (apiKey) extraHeaders['X-API-Key'] = apiKey;
+
     const config = {
       credentials: 'include',
-      cache: 'no-store', // Disable caching
+      cache: 'no-store',
       headers: {
         'Content-Type': 'application/json',
         'Cache-Control': 'no-cache, no-store, must-revalidate',
         'Pragma': 'no-cache',
+        ...extraHeaders,
         ...options.headers,
       },
       ...options,
@@ -25,30 +31,58 @@ class WikiScoutAPI {
     try {
       const response = await fetch(url, config);
       
-      // Handle specific status codes
       if (response.status === 401) {
         window.dispatchEvent(new CustomEvent('auth:unauthorized'));
-        throw new APIError('Unauthorized', 401);
+        throw new APIError('Unauthorized', 401, null, endpoint);
       }
       
       if (response.status === 501) {
         window.dispatchEvent(new CustomEvent('auth:no-team'));
-        throw new APIError('No team number assigned', 501);
+        throw new APIError('No team number assigned', 501, null, endpoint);
       }
 
       if (!response.ok) {
-        const error = await response.json().catch(() => ({ error: 'Request failed' }));
-        throw new APIError(error.error || 'Request failed', response.status);
+        const errData = await response.json().catch(() => ({ error: 'Request failed' }));
+        const apiErr = new APIError(errData.error || 'Request failed', response.status, errData.error_id || null, endpoint);
+        apiErr.errorInfo = {
+          errorId: errData.error_id || null,
+          message: apiErr.message,
+          status: response.status,
+          endpoint,
+          timestamp: new Date().toISOString(),
+        };
+        if (typeof _lastErrorInfo !== 'undefined') _lastErrorInfo = apiErr.errorInfo;
+        // Async: report to server if no error_id came back, update errorInfo when done
+        if (!errData.error_id && typeof errorReporter !== 'undefined') {
+          errorReporter.report({
+            message: apiErr.message,
+            status: response.status,
+            endpoint,
+            context: { method: config.method || 'GET', url },
+          }).then(info => {
+            apiErr.errorInfo = info;
+            if (typeof _lastErrorInfo !== 'undefined') _lastErrorInfo = info;
+          });
+        }
+        throw apiErr;
       }
 
-      // Handle empty responses
       const text = await response.text();
       if (!text) return null;
       
       return JSON.parse(text);
     } catch (error) {
       if (error instanceof APIError) throw error;
-      throw new APIError(error.message || 'Network error', 0);
+      const netErr = new APIError(error.message || 'Network error', 0, null, endpoint);
+      if (typeof errorReporter !== 'undefined') {
+        errorReporter.report({
+          message: netErr.message,
+          endpoint,
+          severity: 'error',
+          context: { type: 'network', url },
+        }).then(info => { netErr.errorInfo = info; });
+      }
+      throw netErr;
     }
   }
 
@@ -65,13 +99,14 @@ class WikiScoutAPI {
     });
   }
 
-  async register(email, password, firstName, lastName, teamNumber) {
+  async register(email, password, firstName, lastName, teamNumber, program = 'FTC') {
     const formData = new FormData();
     formData.append('email', email);
     formData.append('password', password);
     formData.append('first', firstName);
     formData.append('last', lastName);
     formData.append('team', teamNumber);
+    formData.append('program', program);
     
     return this.request('/login/auth/', {
       method: 'POST',
@@ -336,13 +371,52 @@ class WikiScoutAPI {
   async getScoutedTeams(eventCode) {
     return this.request(`/dashboard/scouted_teams/?event=${eventCode}`);
   }
+
+  // Tickets
+  async getTickets() {
+    return this.request('/tickets/list/');
+  }
+
+  async getTicket(id) {
+    return this.request(`/tickets/get/?id=${id}`);
+  }
+
+  async createTicket(subject, category, message) {
+    return this.request('/tickets/create/', {
+      method: 'POST',
+      body: JSON.stringify({ subject, category, message }),
+    });
+  }
+
+  async replyToTicket(ticketId, message) {
+    return this.request('/tickets/reply/', {
+      method: 'POST',
+      body: JSON.stringify({ ticket_id: ticketId, message }),
+    });
+  }
+
+  async reportContent(contentType, contentId, reason, description) {
+    return this.request('/tickets/report/', {
+      method: 'POST',
+      body: JSON.stringify({ content_type: contentType, content_id: contentId, reason, description }),
+    });
+  }
 }
 
 class APIError extends Error {
-  constructor(message, status) {
+  constructor(message, status, errorId, endpoint) {
     super(message);
     this.name = 'APIError';
     this.status = status;
+    this.errorId = errorId || null;
+    this.endpoint = endpoint || null;
+    this.errorInfo = errorId ? {
+      errorId,
+      message,
+      status,
+      endpoint,
+      timestamp: new Date().toISOString(),
+    } : null;
   }
 }
 
